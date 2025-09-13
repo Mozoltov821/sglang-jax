@@ -16,7 +16,7 @@ from sgl_jax.srt.layers.embeddings import (
     RotaryEmbedding,
     ScalingRotaryEmbedding,
 )
-from sgl_jax.srt.layers.layernorm import RMSNorm
+from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit
@@ -117,6 +117,7 @@ class Grok1MoE(nnx.Module):
             output_size=num_experts,
             bias=False,
             params_dtype=jnp.float32,
+            kernel_axes=None,
         )
 
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30)
@@ -191,12 +192,13 @@ class Grok1Attention(nnx.Module):
             use_presharded_weights=self.load_presharded_attn,
             kernel_axes=("tensor", None),
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=int(self.rope_theta),
             is_neox_style=True,
+            dtype=jnp.float32,
         )
 
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
@@ -274,6 +276,8 @@ class Grok1DecoderLayer(nnx.Module):
         load_presharded_moe: bool = False,
         load_presharded_attn: bool = False,
         load_presharded_mlp: bool = False,
+        rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
         self.num_experts = config.num_local_experts
@@ -295,7 +299,6 @@ class Grok1DecoderLayer(nnx.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             reduce_results=False,
-            alt_stream=self.alt_stream,
             load_presharded_attn=load_presharded_attn,
         )
 
@@ -308,6 +311,8 @@ class Grok1DecoderLayer(nnx.Module):
                 use_presharded_weights=load_presharded_moe,
                 inplace=False,  # not self.residual_moe,
                 no_combine=False,  # self.residual_moe,  # just a suggestion to not combine topk
+                rngs=rngs,
+                mesh=mesh,
             )
             if self.residual_moe:
                 self.mlp = Grok1MLP(
@@ -317,6 +322,8 @@ class Grok1DecoderLayer(nnx.Module):
                     use_presharded_weights=load_presharded_mlp,
                     layer_id=layer_id,
                     split_gate_up=split_gate_up,
+                    rngs=rngs,
+                    mesh=mesh,
                 )
         else:
             raise NotImplementedError()
@@ -330,9 +337,9 @@ class Grok1DecoderLayer(nnx.Module):
             if self.residual_moe:
                 # NOTE: self.block_sparse_moe modifies the input in-place,
                 # so we have to call it later. Be aware of any possible related errors.
-                if get_tensor_model_parallel_world_size() > 1:
-                    self.ffn = lambda x: tensor_model_parallel_all_reduce(
-                        self.moe_with_rmoe(x)
+                if mesh.size > 1:
+                    self.ffn = lambda x: jax.lax.psum(
+                        self.moe_with_rmoe(x), axis_name="tensor"
                     )
                 else:
                     self.ffn = self.moe_with_rmoe
@@ -357,7 +364,7 @@ class Grok1DecoderLayer(nnx.Module):
         if deferred_norm is not None:
             assert residual is not None
             # here hidden_states is output of ffn, residual is residual from after previous attn layer
-            hidden_states, residual = fused_dual_residual_rmsnorm(
+            hidden_states, residual = dual_rmsnorm_forward(
                 hidden_states,
                 residual,
                 deferred_norm.weight,
@@ -376,7 +383,7 @@ class Grok1DecoderLayer(nnx.Module):
 
         hidden_states = jax.lax.psum(hidden_states, axis_name="tensor")
 
-        hidden_states, residual = fused_dual_residual_rmsnorm(
+        hidden_states, residual = dual_rmsnorm_forward(
             hidden_states,
             residual,
             self.post_attn_norm.weight,
@@ -403,15 +410,17 @@ class Grok1Model(nnx.Module):
         load_presharded_attn: bool = False,
         load_presharded_mlp: bool = False,
         replicate_embedding: bool = False,
+        rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
+        self.embed_tokens = Embed(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
             use_presharded_weights=load_presharded_embedding,
             enable_tp=not replicate_embedding,
         )
@@ -423,6 +432,8 @@ class Grok1Model(nnx.Module):
                 load_presharded_moe=load_presharded_moe,
                 load_presharded_attn=load_presharded_attn,
                 load_presharded_mlp=load_presharded_mlp,
+                mesh=mesh,
+                rngs=rngs,
             )
             for i in range(config.num_hidden_layers)
         ]
@@ -447,7 +458,7 @@ class Grok1Model(nnx.Module):
                 positions, hidden_states, forward_batch, residual, deferred_norm
             )
 
-        hidden_states, _ = fused_dual_residual_rmsnorm(
+        hidden_states, _ = dual_rmsnorm_forward(
             hidden_states,
             residual,
             deferred_norm.weight,
@@ -462,7 +473,8 @@ class Grok1ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        prefix: str = "",
+        rngs: nnx.Rngs = None,
+        mesh: jax.sharding.Mesh = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -503,23 +515,27 @@ class Grok1ForCausalLM(nnx.Module):
             load_presharded_attn=self.load_presharded_attn,
             load_presharded_mlp=self.load_presharded_mlp,
             replicate_embedding=self.replicate_embedding,
+            rngs=rngs,
+            mesh=mesh,
         )
 
         lm_head_params_dtype = None
         if self.replicate_lm_head:
-            self.lm_head = ReplicatedLinear(
-                config.hidden_size,
-                config.vocab_size,
-                bias=False,
+            self.lm_head = LinearBase(
+                input_size=config.hidden_size,
+                output_size=config.vocab_size,
+                use_bias=False,
                 params_dtype=lm_head_params_dtype,
+                kernel_axes=None,
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
                 use_presharded_weights=self.load_presharded_embedding,
                 params_dtype=lm_head_params_dtype,
+                rngs=rngs,
             )
             self.logits_processor = LogitsProcessor(config)
 
@@ -650,51 +666,3 @@ class Grok1ForCausalLM(nnx.Module):
                 )
 
         return hit_names
-
-    def get_num_params_analytical(self):
-        cfg = self.config
-        moe_intermediate_size = getattr(
-            cfg,
-            "moe_intermediate_size",
-            getattr(cfg, "intermediate_size", None),
-        )
-        residual_moe = getattr(cfg, "residual_moe", False)
-        if cfg.num_local_experts > 0:
-            num_experts = cfg.num_local_experts + (1 if residual_moe else 0)
-        else:
-            num_experts = 1
-
-        wq = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_attention_heads
-            * cfg.head_dim
-        )
-        wkv = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_key_value_heads
-            * cfg.head_dim
-            * 2
-        )
-        out = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_attention_heads
-            * cfg.head_dim
-        )
-        ffn1 = (
-            cfg.num_hidden_layers
-            * num_experts
-            * cfg.hidden_size
-            * moe_intermediate_size
-            * 2
-        )
-        ffn2 = (
-            cfg.num_hidden_layers
-            * num_experts
-            * cfg.hidden_size
-            * moe_intermediate_size
-        )
-        embed = cfg.hidden_size * cfg.vocab_size * 2
-        return wq + wkv + out + ffn1 + ffn2 + embed

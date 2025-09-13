@@ -47,3 +47,19 @@ def rmsnorm_forward(
         return output
     else:
         return output, residual
+
+
+def dual_rmsnorm_forward(x, residual, weight1, weight2, epsilon):
+    dtype = x.dtype
+
+    x_f32 = jnp.asarray(x, jnp.float32)
+    x_rrms = jnp.rsqrt(jnp.mean(lax.square(x_f32), axis=-1, keepdims=True) + epsilon)
+
+    w1 = jnp.asarray(weight1, jnp.float32)
+    y = jnp.asarray(x_f32 * x_rrms * w1, jnp.float32)
+
+    y_rrms = jnp.rsqrt(jnp.mean(lax.square(y), axis=-1, keepdims=True) + epsilon)
+    w2 = jnp.asarray(weight2, jnp.float32)
+    z = jnp.asarray(y * y_rrms * w2, jnp.float32)
+
+    return z, y.to(residual.dtype)

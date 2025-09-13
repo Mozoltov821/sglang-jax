@@ -113,7 +113,6 @@ class EPMoE(nnx.Module):
         layer_id: int = 0,
         rngs: Optional[nnx.Rngs] = None,
     ):
-
         self.config = config
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -504,11 +503,7 @@ class EPMoE(nnx.Module):
         intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
         weights_fp32 = reshaped_weights.astype(jnp.float32)
 
-        output = jnp.einsum(
-            "BKE,BK -> BE",
-            intermediate_fp32,
-            weights_fp32,
-        )
+        output = jnp.einsum("BKE,BK -> BE", intermediate_fp32, weights_fp32)
 
         if len(weights.shape) == 2:
             final_output = output.astype(self.dtype)
