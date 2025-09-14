@@ -2,8 +2,8 @@ import functools
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+import jax
 from flax import nnx
-from jax import jax
 from jax import numpy as jnp
 from jax.sharding import get_abstract_mesh
 from transformers import PretrainedConfig
@@ -111,33 +111,34 @@ class Grok1MoE(nnx.Module):
     ):
         super().__init__()
 
+        if mesh is None:
+            mesh = get_abstract_mesh()
         # Gate always runs at full precision for stability (see https://arxiv.org/pdf/2101.03961)
         self.gate = LinearBase(
             input_size=config.hidden_size,
-            output_size=num_experts,
-            bias=False,
+            output_size=config.num_local_experts,
+            use_bias=False,
             params_dtype=jnp.float32,
             kernel_axes=None,
+            rngs=rngs,
         )
 
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30)
 
         expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
-        num_experts = getattr(config, "num_experts", 128)
-        with mesh:
-            self.experts = EPMoE(
-                config=config,
-                num_experts=config.num_experts,
-                num_experts_per_tok=config.num_experts_per_tok,
-                expert_parallel_size=expert_parallel_size,
-                use_moe_router_tok=True,
-                mesh=mesh,
-                intermediate_dim=config.moe_intermediate_size,
-                dtype=dtype,
-                activation="gelu",
-                layer_id=layer_id,
-                rngs=rngs,
-            )
+        # with mesh:
+        self.experts = EPMoE(
+            config=config,
+            num_experts=config.num_local_experts,
+            num_experts_per_tok=config.num_experts_per_tok,
+            expert_parallel_size=expert_parallel_size,
+            mesh=mesh,
+            intermediate_dim=config.moe_intermediate_size,
+            dtype=dtype,
+            activation="gelu",
+            layer_id=layer_id,
+            rngs=rngs,
+        )
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         router_logits = self.gate(hidden_states)
@@ -159,6 +160,7 @@ class Grok1Attention(nnx.Module):
         rope_theta: float = 10000,
         reduce_results: bool = True,
         load_presharded_attn: bool = False,
+        rngs: Optional[nnx.Rngs] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -180,22 +182,24 @@ class Grok1Attention(nnx.Module):
         self.qkv_proj = LinearBase(
             input_size=hidden_size,
             output_size=num_heads * self.head_dim,
-            bias=False,
-            load_presharded_attn=self.load_presharded_attn,
+            use_bias=False,
+            # load_presharded_attn=self.load_presharded_attn,
             kernel_axes=(None, "tensor"),
+            rngs=rngs,
         )
         self.o_proj = LinearBase(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            reduce_results=reduce_results,
-            use_presharded_weights=self.load_presharded_attn,
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=hidden_size,
+            use_bias=False,
+            # reduce_results=reduce_results,
+            # use_presharded_weights=self.load_presharded_attn,
             kernel_axes=("tensor", None),
+            rngs=rngs,
         )
         self.rotary_emb = RotaryEmbedding(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=max_position,
+            max_position_embeddings=max_position,
             base=int(self.rope_theta),
             is_neox_style=True,
             dtype=jnp.float32,
@@ -300,6 +304,7 @@ class Grok1DecoderLayer(nnx.Module):
             rope_theta=rope_theta,
             reduce_results=False,
             load_presharded_attn=load_presharded_attn,
+            rngs=rngs,
         )
 
         split_gate_up = not getattr(config, "merge_gate_up", True)
@@ -307,10 +312,10 @@ class Grok1DecoderLayer(nnx.Module):
             self.block_sparse_moe = Grok1MoE(
                 config=config,
                 layer_id=layer_id,
-                reduce_results=not self.residual_moe,
-                use_presharded_weights=load_presharded_moe,
-                inplace=False,  # not self.residual_moe,
-                no_combine=False,  # self.residual_moe,  # just a suggestion to not combine topk
+                # reduce_results=not self.residual_moe,
+                # use_presharded_weights=load_presharded_moe,
+                # inplace=False,  # not self.residual_moe,
+                # no_combine=False,  # self.residual_moe,  # just a suggestion to not combine topk
                 rngs=rngs,
                 mesh=mesh,
             )
@@ -318,8 +323,8 @@ class Grok1DecoderLayer(nnx.Module):
                 self.mlp = Grok1MLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=config.intermediate_size,
-                    reduce_results=False,
-                    use_presharded_weights=load_presharded_mlp,
+                    # reduce_results=False,
+                    # use_presharded_weights=load_presharded_mlp,
                     layer_id=layer_id,
                     split_gate_up=split_gate_up,
                     rngs=rngs,
@@ -421,14 +426,15 @@ class Grok1Model(nnx.Module):
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
-            use_presharded_weights=load_presharded_embedding,
-            enable_tp=not replicate_embedding,
+            rngs=rngs,
+            # use_presharded_weights=load_presharded_embedding,
+            # enable_tp=not replicate_embedding,
         )
 
         self.layers = [
             Grok1DecoderLayer(
-                config,
-                i,
+                config=config,
+                layer_id=i,
                 load_presharded_moe=load_presharded_moe,
                 load_presharded_attn=load_presharded_attn,
                 load_presharded_mlp=load_presharded_mlp,
@@ -478,13 +484,15 @@ class Grok1ForCausalLM(nnx.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        if mesh is None:
+            mesh = get_abstract_mesh()
 
         # Get presharded weights.
         self.load_presharded_mlp = getattr(config, "load_presharded_mlp", False)
         self.load_presharded_moe = (
             getattr(config, "load_presharded_moe", True)
             and self.config.num_local_experts > 0
-            and get_tensor_model_parallel_world_size() > 1
+            and mesh.shape.get("tensor", 1) > 1
         )
         self.load_presharded_attn = getattr(config, "load_presharded_attn", False)
         self.load_presharded_embedding = getattr(
@@ -553,116 +561,39 @@ class Grok1ForCausalLM(nnx.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(
-        self,
-        weights: Iterable[Tuple[str, jax.Array]],
-        ignore_parent_name: bool = False,
-        check_hit_names: bool = True,
-        model_config: PretrainedConfig | None = None,
-    ) -> dict[str, jax.Array]:
-        if model_config is None:
-            model_config = self.config
-
-        stacked_params_mapping = []
-        stacked_params_mapping += [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-        stacked_params_mapping += [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        num_experts = model_config.num_local_experts
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=num_experts,
+    def load_weights(self, rng_key: jax.Array):
+        self.rng = nnx.Rngs(rng_key)
+        loader = WeightLoader(
+            model=self, model_config=self.config, mesh=self.mesh, dtype=self.dtype
         )
+        weight_mappings = self._create_grok_weight_mappings()
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("Grok weights loaded successfully!")
 
-        params_dict = dict(self.named_parameters())
-        all_names = set(params_dict.keys())
-        hit_names = set()
+    def _create_grok_weight_mappings(self) -> dict:
+        mappings = {
+            "model.embed_tokens.weight": WeightMapping(
+                target_path="transformer.embed_tokens.embedding",
+                sharding=(None, None),
+                transpose=False,
+            ),
+            "model.norm.weight": WeightMapping(
+                target_path="transformer.norm.scale", sharding=(None,), transpose=False
+            ),
+        }
 
-        def load_weight_wrapper(name: str, loaded_weight: jax.Array, *args, **kwargs):
-            # Fuse constant multipliers into the weights
-            if "lm_head" in name:
-                loaded_weight = (
-                    loaded_weight.to(jnp.float32) * model_config.output_multiplier_scale
-                )
+        if not getattr(self.config.hf_config, "tie_word_embeddings", True):
+            mappings["lm_head.weight"] = WeightMapping(
+                target_path="lm_head.embedding", sharding=(None, None), transpose=False
+            )
 
-            original_name = name
-            if ignore_parent_name:
-                name = name.split(".")[-1]
+        num_layers = self.config.hf_config.num_hidden_layers
+        mlp_only_layers = getattr(self.config.hf_config, "mlp_only_layers", [])
 
-            if name not in params_dict:
-                logger.info(f"Skipping {name=} in load_weights_wrapper")
-                return
+        for layer_idx in range(num_layers):
+            layer_mappings = self._create_moe_layer_mappings(
+                layer_idx, layer_idx in mlp_only_layers
+            )
+            mappings.update(layer_mappings)
 
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight, *args, **kwargs)
-            hit_names.add(name)
-            self.loaded_param_names.add(original_name)
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                load_weight_wrapper(name, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-
-                    load_weight_wrapper(
-                        name,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name is None:
-                        continue
-
-                    load_weight_wrapper(name=name, loaded_weight=loaded_weight)
-
-        if check_hit_names:
-            if len(hit_names) > 5:
-                missing = all_names - hit_names
-                missing_exclude_scales = {x for x in missing if "scale" not in x}
-                logger.info(
-                    f"#all_names: {len(all_names)}, #hit_names: {len(hit_names)}, #missing_exclude_scales: {len(missing_exclude_scales)}",
-                )
-                if len(missing_exclude_scales) > 0:
-                    raise ValueError(
-                        f"load_weights failed because some weights are missing: {missing_exclude_scales=}."
-                    )
-
-            elif len(hit_names) == 0:
-                raise ValueError(
-                    f"load_weights failed because it did not hit any names. {all_names=} {hit_names=}"
-                )
-
-        return hit_names
+        return mappings

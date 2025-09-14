@@ -317,12 +317,12 @@ def _yarn_find_correction_range(
 
 def _yarn_linear_ramp_mask(
     low: float, high: float, dim: int, dtype: jnp.dtype
-) -> jnp.Array:
+) -> jax.Array:
     if low == high:
         high += 0.001  # Prevent singularity
 
     linear_func = (jnp.arange(dim, dtype=dtype) - low) / (high - low)
-    ramp_func = jax.lax.clamp(linear_func, 0, 1)
+    ramp_func = jnp.clip(linear_func, min=0, max=1)
     return ramp_func
 
 
@@ -363,7 +363,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-    def _compute_inv_freq(self, scaling_factor: float) -> jnp.Array:
+    def _compute_inv_freq(self, scaling_factor: float) -> jax.Array:
         pos_freqs = self.base ** (
             jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim
         )
@@ -410,7 +410,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
             raise ValueError(f"Unknown extrapolation method: {self.extra_method}")
         return inv_freq
 
-    def _compute_cos_sin_cache(self) -> jnp.Array:
+    def _compute_cos_sin_cache(self) -> jax.Array:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = jnp.arange(
             self.max_position_embeddings * self.scaling_factor, dtype=jnp.float32
@@ -418,7 +418,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         freqs = jnp.einsum("i,j -> ij", t, inv_freq)
         # cos = freqs.cos() * self.mscale
         # sin = freqs.sin() * self.mscale
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = jnp.concat((cos, sin), dim=-1)
+        cos = jnp.cos(freqs)
+        sin = jnp.sin(freqs)
+        cache = jnp.concat((cos, sin), axis=-1)
         return cache

@@ -34,6 +34,9 @@ class RadixAttention(nnx.Module):
         scaling: float,
         num_kv_heads: int,
         layer_id: int,
+        logit_cap: float = 0.0,
+        pos_encoding_mode: str = "NONE",
+        logit_capping_method: str = "tanh",
         v_head_dim: int = -1,
         attn_type: AttentionType = AttentionType.DECODER,
     ):
@@ -45,7 +48,11 @@ class RadixAttention(nnx.Module):
         self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
         self.scaling = scaling
         self.layer_id = layer_id
+        self.logit_cap = logit_cap
         self.attn_type = attn_type
+
+        self.pos_encoding_mode = pos_encoding_mode
+        self.logit_capping_method = logit_capping_method
 
     def __call__(
         self,
