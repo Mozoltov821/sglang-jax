@@ -1,14 +1,12 @@
-import functools
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Optional, Tuple
 
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax._src.mesh import get_abstract_mesh, use_abstract_mesh
 from transformers import PretrainedConfig
 
-from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.activation import GeluAndMul
 from sgl_jax.srt.layers.embeddings import (
     Embed,
@@ -18,8 +16,8 @@ from sgl_jax.srt.layers.embeddings import (
 )
 from sgl_jax.srt.layers.layernorm import RMSNorm, dual_rmsnorm_forward
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import EPMoE, GateLogit
+from sgl_jax.srt.layers.logits_processor import LogitsProcessor
+from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -126,19 +124,19 @@ class Grok1MoE(nnx.Module):
         self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30)
 
         expert_parallel_size = mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
-        # with mesh:
-        self.experts = EPMoE(
-            config=config,
-            num_experts=config.num_local_experts,
-            num_experts_per_tok=config.num_experts_per_tok,
-            expert_parallel_size=expert_parallel_size,
-            mesh=mesh,
-            intermediate_dim=config.moe_intermediate_size,
-            dtype=dtype,
-            activation="gelu",
-            layer_id=layer_id,
-            rngs=rngs,
-        )
+        with use_abstract_mesh(mesh):
+            self.experts = EPMoE(
+                config=config,
+                num_experts=config.num_local_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                expert_parallel_size=expert_parallel_size,
+                mesh=mesh,
+                intermediate_dim=config.moe_intermediate_size,
+                dtype=dtype,
+                activation="gelu",
+                layer_id=layer_id,
+                rngs=rngs,
+            )
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
         router_logits = self.gate(hidden_states)
@@ -221,7 +219,7 @@ class Grok1Attention(nnx.Module):
             )
             pos_encoding_mode = "NONE"
         else:
-            self.rotary_emb = get_rope(
+            self.rotary_emb = RotaryEmbedding(
                 self.head_dim,
                 rotary_dim=(
                     self.head_dim
@@ -280,8 +278,8 @@ class Grok1DecoderLayer(nnx.Module):
         load_presharded_moe: bool = False,
         load_presharded_attn: bool = False,
         load_presharded_mlp: bool = False,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
+        rngs: Optional[nnx.Rngs] = None,
+        mesh: Optional[jax.sharding.Mesh] = None,
     ) -> None:
         super().__init__()
         self.num_experts = config.num_local_experts
@@ -415,8 +413,8 @@ class Grok1Model(nnx.Module):
         load_presharded_attn: bool = False,
         load_presharded_mlp: bool = False,
         replicate_embedding: bool = False,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
+        rngs: Optional[nnx.Rngs] = None,
+        mesh: Optional[jax.sharding.Mesh] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -479,8 +477,8 @@ class Grok1ForCausalLM(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        rngs: nnx.Rngs = None,
-        mesh: jax.sharding.Mesh = None,
+        rngs: Optional[nnx.Rngs] = None,
+        mesh: Optional[jax.sharding.Mesh] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -597,3 +595,6 @@ class Grok1ForCausalLM(nnx.Module):
             mappings.update(layer_mappings)
 
         return mappings
+
+    def _create_moe_layer_mappings(self, layer_id) -> dict:
+        pass
