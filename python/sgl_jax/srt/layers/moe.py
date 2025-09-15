@@ -155,10 +155,10 @@ class EPMoE(nnx.Module):
             )
         )
 
-        state = nnx.state(self)
-        pspecs = nnx.get_partition_spec(state)
-        sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-        nnx.update(self, sharded_state)
+        # state = nnx.state(self)
+        # pspecs = nnx.get_partition_spec(state)
+        # sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
+        # nnx.update(self, sharded_state)
 
     def _detect_device_capabilities(self):
         try:

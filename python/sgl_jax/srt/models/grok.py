@@ -66,7 +66,7 @@ class Grok1MLP(nnx.Module):
 
         self.gate_up_proj = LinearBase(
             input_size=hidden_size,
-            output_size=[intermediate_size] * 2,
+            output_size=intermediate_size * 2,
             use_bias=False,
             params_dtype=dtype,
             kernel_axes=(None, "tensor"),
@@ -84,9 +84,9 @@ class Grok1MLP(nnx.Module):
         self.layer_id = layer_id
 
     def __call__(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x, _ = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        gate_up = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x = self.down_proj(x)
         return x
 
 
@@ -324,17 +324,24 @@ class Grok1DecoderLayer(nnx.Module):
                     # reduce_results=False,
                     # use_presharded_weights=load_presharded_mlp,
                     layer_id=layer_id,
-                    split_gate_up=split_gate_up,
+                    # split_gate_up=split_gate_up,
                     rngs=rngs,
-                    mesh=mesh,
                 )
         else:
             raise NotImplementedError()
 
-        self.pre_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_moe_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_moe_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_attn_norm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+        )
+        self.post_attn_norm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+        )
+        self.pre_moe_norm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+        )
+        self.post_moe_norm = RMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs
+        )
 
         if self.num_experts > 0:
             if self.residual_moe:
@@ -441,7 +448,7 @@ class Grok1Model(nnx.Module):
             )
             for i in range(config.num_hidden_layers)
         ]
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, rngs=rngs)
 
     def forward(
         self,

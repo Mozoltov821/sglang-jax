@@ -53,6 +53,7 @@ class RadixAttention(nnx.Module):
 
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
+        self.xai_temperature_len = -1
 
     def __call__(
         self,
