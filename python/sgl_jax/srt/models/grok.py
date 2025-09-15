@@ -157,7 +157,6 @@ class Grok1Attention(nnx.Module):
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
         reduce_results: bool = True,
-        load_presharded_attn: bool = False,
         rngs: Optional[nnx.Rngs] = None,
     ) -> None:
         super().__init__()
@@ -174,14 +173,12 @@ class Grok1Attention(nnx.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         rope_scaling = get_rope_scaling(config)
-        self.load_presharded_attn = load_presharded_attn
 
         num_heads = self.total_num_heads + self.total_num_kv_heads
         self.qkv_proj = LinearBase(
             input_size=hidden_size,
             output_size=num_heads * self.head_dim,
             use_bias=False,
-            # load_presharded_attn=self.load_presharded_attn,
             kernel_axes=(None, "tensor"),
             rngs=rngs,
         )
@@ -190,7 +187,6 @@ class Grok1Attention(nnx.Module):
             output_size=hidden_size,
             use_bias=False,
             # reduce_results=reduce_results,
-            # use_presharded_weights=self.load_presharded_attn,
             kernel_axes=("tensor", None),
             rngs=rngs,
         )
@@ -275,9 +271,6 @@ class Grok1DecoderLayer(nnx.Module):
         self,
         config: PretrainedConfig,
         layer_id: int = 0,
-        load_presharded_moe: bool = False,
-        load_presharded_attn: bool = False,
-        load_presharded_mlp: bool = False,
         rngs: Optional[nnx.Rngs] = None,
         mesh: Optional[jax.sharding.Mesh] = None,
     ) -> None:
@@ -301,7 +294,6 @@ class Grok1DecoderLayer(nnx.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             reduce_results=False,
-            load_presharded_attn=load_presharded_attn,
             rngs=rngs,
         )
 
@@ -311,7 +303,6 @@ class Grok1DecoderLayer(nnx.Module):
                 config=config,
                 layer_id=layer_id,
                 # reduce_results=not self.residual_moe,
-                # use_presharded_weights=load_presharded_moe,
                 # inplace=False,  # not self.residual_moe,
                 # no_combine=False,  # self.residual_moe,  # just a suggestion to not combine topk
                 rngs=rngs,
@@ -322,7 +313,6 @@ class Grok1DecoderLayer(nnx.Module):
                     hidden_size=config.hidden_size,
                     intermediate_size=config.intermediate_size,
                     # reduce_results=False,
-                    # use_presharded_weights=load_presharded_mlp,
                     layer_id=layer_id,
                     # split_gate_up=split_gate_up,
                     rngs=rngs,
@@ -415,11 +405,6 @@ class Grok1Model(nnx.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        load_presharded_moe: bool = False,
-        load_presharded_embedding: bool = False,
-        load_presharded_attn: bool = False,
-        load_presharded_mlp: bool = False,
-        replicate_embedding: bool = False,
         rngs: Optional[nnx.Rngs] = None,
         mesh: Optional[jax.sharding.Mesh] = None,
     ) -> None:
@@ -432,23 +417,14 @@ class Grok1Model(nnx.Module):
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
             rngs=rngs,
-            # use_presharded_weights=load_presharded_embedding,
             # enable_tp=not replicate_embedding,
         )
 
         self.layers = [
-            Grok1DecoderLayer(
-                config=config,
-                layer_id=i,
-                load_presharded_moe=load_presharded_moe,
-                load_presharded_attn=load_presharded_attn,
-                load_presharded_mlp=load_presharded_mlp,
-                mesh=mesh,
-                rngs=rngs,
-            )
+            Grok1DecoderLayer(config=config, layer_id=i, mesh=mesh, rngs=rngs)
             for i in range(config.num_hidden_layers)
         ]
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, rngs=rngs)
+        self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, rngs=rngs)
 
     def forward(
         self,
@@ -492,64 +468,16 @@ class Grok1ForCausalLM(nnx.Module):
         if mesh is None:
             mesh = get_abstract_mesh()
 
-        # Get presharded weights.
-        self.load_presharded_mlp = getattr(config, "load_presharded_mlp", False)
-        self.load_presharded_moe = (
-            getattr(config, "load_presharded_moe", True)
-            and self.config.num_local_experts > 0
-            and mesh.shape.get("tensor", 1) > 1
-        )
-        self.load_presharded_attn = getattr(config, "load_presharded_attn", False)
-        self.load_presharded_embedding = getattr(
-            config, "load_presharded_embedding", False
-        )
-
-        self.is_weights_presharded = (
-            self.load_presharded_mlp
-            or self.load_presharded_moe
-            or self.load_presharded_attn
-            or self.load_presharded_embedding
-        )
-
-        default_replicate_lm_head = False
-        self.replicate_lm_head = getattr(
-            config, "replicate_lm_head", default_replicate_lm_head
-        )
-
-        # if self.is_weights_presharded:
-        #     setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
-
-        self.replicate_embedding = getattr(config, "replicate_embedding", False)
-
-        self.model = Grok1Model(
-            config,
-            load_presharded_moe=self.load_presharded_moe,
-            load_presharded_embedding=self.load_presharded_embedding,
-            load_presharded_attn=self.load_presharded_attn,
-            load_presharded_mlp=self.load_presharded_mlp,
-            replicate_embedding=self.replicate_embedding,
-            rngs=rngs,
-            mesh=mesh,
-        )
+        self.model = Grok1Model(config, rngs=rngs, mesh=mesh)
 
         lm_head_params_dtype = None
-        if self.replicate_lm_head:
-            self.lm_head = Embed(
-                num_embeddings=config.vocab_size,
-                features=config.hidden_size,
-                params_dtype=lm_head_params_dtype,
-                rngs=rngs,
-            )
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
-        else:
-            self.lm_head = ParallelLMHead(
-                num_embeddings=config.vocab_size,
-                features=config.hidden_size,
-                use_presharded_weights=self.load_presharded_embedding,
-                params_dtype=lm_head_params_dtype,
-                rngs=rngs,
-            )
-            self.logits_processor = LogitsProcessor(config)
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            param_dtype=lm_head_params_dtype,
+            rngs=rngs,
+        )
+        self.logits_processor = LogitsProcessor(config, lm_head=self.lm_head, mesh=mesh)
 
         self.loaded_param_names = set()
 
