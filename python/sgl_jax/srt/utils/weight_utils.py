@@ -136,7 +136,9 @@ class WeightLoader:
                     mapping = WeightMapping(target_path=mapping)
 
                 self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
-            elif "mlp.experts." in hf_key and hf_key.endswith(".weight"):
+            elif (
+                "mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key
+            ) and hf_key.endswith(".weight"):
                 expert_weights[hf_key] = hf_weight.astype(self.dtype)
             else:
                 logger.warning(f"No mapping found for weight: {hf_key}")

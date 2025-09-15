@@ -516,8 +516,8 @@ class Grok1ForCausalLM(nnx.Module):
             config, "replicate_lm_head", default_replicate_lm_head
         )
 
-        if self.is_weights_presharded:
-            setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
+        # if self.is_weights_presharded:
+        #     setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
 
         self.replicate_embedding = getattr(config, "replicate_embedding", False)
 
@@ -534,12 +534,11 @@ class Grok1ForCausalLM(nnx.Module):
 
         lm_head_params_dtype = None
         if self.replicate_lm_head:
-            self.lm_head = LinearBase(
-                input_size=config.hidden_size,
-                output_size=config.vocab_size,
-                use_bias=False,
+            self.lm_head = Embed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
                 params_dtype=lm_head_params_dtype,
-                kernel_axes=None,
+                rngs=rngs,
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
@@ -575,15 +574,29 @@ class Grok1ForCausalLM(nnx.Module):
         loader.load_weights_from_safetensors(weight_mappings)
         logger.info("Grok weights loaded successfully!")
 
+    def _create_moe_weight_mappings(
+        self, layer_idx: int, state_name: str, model_name: str
+    ):
+        return {
+            f"__MOE_EXPERTS__{model_name}": WeightMapping(
+                target_path=[
+                    f"model.layers.{layer_idx}.block_sparse_moe.experts.{model_name}.weight",
+                ]
+                + [
+                    f"model.layers.{layer_idx}.block_sparse_moe.experts.{eid}.{state_name}.weight"
+                    for eid in range(self.config.hf_config.num_local_experts)
+                ],
+                sharding=(("data", "tensor"), None, None),
+                transpose=False,
+            )
+        }
+
     def _create_grok_weight_mappings(self) -> dict:
         mappings = {
             "model.embed_tokens.weight": WeightMapping(
-                target_path="transformer.embed_tokens.embedding",
+                target_path="model.embed_tokens.embedding",
                 sharding=(None, None),
                 transpose=False,
-            ),
-            "model.norm.weight": WeightMapping(
-                target_path="transformer.norm.scale", sharding=(None,), transpose=False
             ),
         }
 
@@ -593,15 +606,59 @@ class Grok1ForCausalLM(nnx.Module):
             )
 
         num_layers = self.config.hf_config.num_hidden_layers
-        mlp_only_layers = getattr(self.config.hf_config, "mlp_only_layers", [])
-
         for layer_idx in range(num_layers):
-            layer_mappings = self._create_moe_layer_mappings(
-                layer_idx, layer_idx in mlp_only_layers
+            mappings[f"model.layers.{layer_idx}.mlp.gate_proj.weight"] = WeightMapping(
+                target_path=f"model.layers.{layer_idx}.mlp.gate_proj.weight",
+                sharding=(None, None),
+                transpose=False,
             )
-            mappings.update(layer_mappings)
+            mappings[f"model.layers.{layer_idx}.mlp.down_proj.weight"] = WeightMapping(
+                target_path=f"model.layers.{layer_idx}.mlp.down_proj.weight",
+                sharding=(None, None),
+                transpose=False,
+            )
+            mappings[f"model.layers.{layer_idx}.mlp.up_proj.weight"] = WeightMapping(
+                target_path=f"model.layers.{layer_idx}.mlp.up_proj.weight",
+                sharding=(None, None),
+                transpose=False,
+            )
+            mappings.update(self._create_moe_weight_mappings(layer_idx, "w1", "wi_0"))
+            mappings.update(self._create_moe_weight_mappings(layer_idx, "w2", "wi_1"))
+            mappings.update(self._create_moe_weight_mappings(layer_idx, "w3", "wo"))
+            mappings[f"model.layers.{layer_idx}.block_sparse_moe.gate.weight"] = (
+                WeightMapping(
+                    target_path=f"model.layers.{layer_idx}.block_sparse_moe.gate.weight",
+                    sharding=(None, None),
+                    transpose=False,
+                )
+            )
+
+            for key in ("q_proj", "k_proj", "v_proj"):
+                mappings[f"model.layers.{layer_idx}.self_attn.{key}.weight"] = (
+                    WeightMapping(
+                        target_path=f"model.layers.{layer_idx}.attn.{key}.weight",
+                        sharding=(None, "tensor"),
+                        transpose=False,
+                    )
+                )
+            mappings[f"model.layers.{layer_idx}.self_attn.o_proj.weight"] = (
+                WeightMapping(
+                    target_path=f"model.layers.{layer_idx}.attn.o_proj.weight",
+                    sharding=("tensor", None),
+                    transpose=False,
+                )
+            )
+
+            for key in (
+                "pre_attn_norm",
+                "post_attn_norm",
+                "pre_moe_norm",
+                "post_moe_norm",
+            ):
+                mappings[f"model.layers.{layer_idx}.{key}.weight"] = WeightMapping(
+                    target_path=f"model.layers.{layer_idx}.{key}.weight",
+                    sharding=(None, None),
+                    transpose=False,
+                )
 
         return mappings
-
-    def _create_moe_layer_mappings(self, layer_id) -> dict:
-        pass
