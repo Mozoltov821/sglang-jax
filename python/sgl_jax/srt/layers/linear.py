@@ -59,7 +59,7 @@ class LinearBase(nnx.Module):
         """Forward pass of the linear layer."""
         bias = self.bias if not self.skip_bias_add else None
         # Access the underlying JAX array using .value property
-        output = jnp.dot(x, self.weight.value)
+        output = jnp.matmul(x, jnp.matrix_transpose(self.weight))
         if bias is not None:
             output = output + bias.value
         output_bias = self.bias if self.skip_bias_add else None
