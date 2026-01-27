@@ -51,15 +51,58 @@ class VideoResponse(BaseModel):
     path: str | None = None
 
 
+
+class AudioSpeechRequest(BaseModel):
+    """OpenAI /v1/audio/speech request."""
+    input: str
+    model: str
+    voice: str
+    response_format: str = "mp3"
+    speed: float = 1.0
+    instructions: str | None = None
+    stream_format: str | None = None
+
+
+class AudioTranscriptionRequest(BaseModel):
+    file: bytes | None = None
+    url: str | None = None
+    model: str
+    language: str | None = None
+    prompt: str | None = None
+    response_format: str = "json"
+    temperature: float | None = None
+    timestamp_granularities: list[str] | None = None
+    chunking_strategy: dict | None = None
+    known_speaker_names: list[str] | None = None
+    known_speaker_references: list[str] | None = None
+    include: list[str] | None = None
+    stream: bool = False
+
+
+class AudioTranscriptionResponse(BaseModel):
+    """OpenAI transcription response (json format)."""
+    text: str
+    task: str | None = None
+    language: str | None = None
+    duration: float | None = None
+    segments: list[dict] | None = None
+    words: list[dict] | None = None
+
+    usage: dict | None = None
+
+
 class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
+    AUDIO = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "jpg"
-        else:
+        elif self == DataType.VIDEO:
             return "mp4"
+        else:
+            return "wav"
 
 
 @dataclasses.dataclass
