@@ -45,6 +45,7 @@ dependencies = [
     "omegaconf",
     "imageio[ffmpeg]",
     "qwix",
+    "librosa",
 ]
 
 [project.optional-dependencies]

@@ -86,31 +86,41 @@ class AudioScheduler:
 
     def preprocess(self, req: Req):
         sharding = NamedSharding(self.mesh, PartitionSpec())
-        if req.audio_mode in ("encode", "generation"):
+        if req.audio_mode in ("generation", "asr", "audio_understanding"):
             # Use mel_input (preprocessed in tokenizer) instead of audio_input
             if req.mel_input is not None:
                 req.mel_input = device_array(req.mel_input, sharding=sharding)
             if req.mel_input_lens is not None:
                 req.mel_input_lens = device_array(req.mel_input_lens, sharding=sharding)
-        elif req.audio_mode == "decode" and req.codes is not None:
-            req.codes = device_array(req.codes, sharding=sharding)
 
     def run_audio_batch(self, batch: list[Req]):
         for req in batch:
-            mode = req.audio_mode or "encode"
+            mode = req.audio_mode
             logger.info("AudioScheduler.run_audio_batch: mode=%s, rid=%s", mode, req.rid)
-            if mode in ("encode", "generation"):
-                output, _ = self.audio_worker.forward(
-                    req, mode="encode", use_quantizer=req.use_quantizer, n_q=req.n_q
-                )
-                req.output = jax.device_get(output.codes)
-                logger.info(
-                    "AudioScheduler encode output: codes shape=%s",
-                    req.output.shape if req.output is not None else None,
-                )
+
+            if mode in ("generation", "asr", "audio_understanding"):
+                if req.mel_input is not None:
+                    output, _ = self.audio_worker.forward(
+                        req, mode="encode", use_quantizer=req.use_quantizer, n_q=req.n_q
+                    )
+                    req.output = jax.device_get(output.codes)
+                    logger.info(
+                        "AudioScheduler encode output: codes shape=%s",
+                        req.output.shape if req.output is not None else None,
+                    )
+                else:
+                    logger.info(
+                        "AudioScheduler skipping encode for mode=%s, rid=%s (no mel_input)",
+                        mode,
+                        req.rid,
+                    )
+
+            elif mode == "tts":
+                # Pass-through for TTS at encoder stage (text input only)
+                pass
+
             else:
-                output, _ = self.audio_worker.forward(req, mode="decode")
-                req.output = jax.device_get(output)
+                logger.warning("AudioScheduler received unknown or unhandled mode: %s", mode)
 
             # Clear inputs to free memory
             req.mel_input = None

@@ -125,10 +125,10 @@ def to_mappings(config: PretrainedConfig) -> dict[str, WeightMapping]:
     )
 
     # ===== MiMo-specific layers =====
-    # LM head
+    # LM head (ParallelLMHead stores weights as 'embedding', not 'weight')
     mappings["lm_head.weight"] = WeightMapping(
-        target_path="lm_head.weight",
-        transpose=True,
+        target_path="lm_head.embedding",
+        transpose=False,  # ParallelLMHead expects [vocab_size, hidden_size]
     )
 
     # Projection layers

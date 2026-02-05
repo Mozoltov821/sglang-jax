@@ -264,6 +264,8 @@ class GlobalScheduler:
         - If no new requests are available, poll each stage for outputs via
           `stage.try_collect()` and either forward final outputs to the
           detokenizer socket or enqueue the next-stage requests.
+        - For backbone stages: if generation is not finished, build next step
+          input and send back to backbone for continued autoregressive generation.
         The loop runs forever; external supervision should manage process
         lifecycle and termination.
         """
@@ -301,6 +303,33 @@ class GlobalScheduler:
                         )
                         continue
 
+                    # Handle backbone stage autoregressive loop
+                    if self.stage_configs[i].scheduler == "audio_backbone":
+                        if not stage_result.is_finished:
+                            # Generation not finished - send back to backbone
+                            self._handle_backbone_continue(stage_result, i)
+                            continue
+                        else:
+                            # Generation finished - include accumulated tokens
+                            tracking_state = self.req_store.get(stage_result.rid)
+                            if tracking_state is not None:
+                                # Add final token to accumulated list
+                                if not hasattr(tracking_state, "accumulated_text_tokens"):
+                                    tracking_state.accumulated_text_tokens = []
+                                if stage_result.generated_text_tokens is not None:
+                                    tracking_state.accumulated_text_tokens.extend(
+                                        stage_result.generated_text_tokens.tolist()
+                                    )
+                                # Set accumulated tokens on the request
+                                stage_result.generated_text_tokens = (
+                                    tracking_state.accumulated_text_tokens
+                                )
+                                logger.info(
+                                    "Backbone finished for rid=%s, total tokens=%d",
+                                    stage_result.rid,
+                                    len(tracking_state.accumulated_text_tokens),
+                                )
+
                     if self.stage_configs[i].final_output:
                         self.send_to_detokenizer.send_pyobj(stage_result)
                         del self.req_store[stage_result.rid]
@@ -314,6 +343,74 @@ class GlobalScheduler:
                         )
                         for stage_req in stage_reqs:
                             self.in_queues[next_stage].put_nowait(stage_req)
+
+    def _handle_backbone_continue(self, req: Req, stage_idx: int):
+        """Handle backbone stage continuation for autoregressive generation.
+
+        Builds next step input and sends request back to backbone stage.
+
+        Args:
+            req: The request with generated tokens.
+            stage_idx: The backbone stage index.
+        """
+        # Accumulate generated tokens in tracking state
+        tracking_state = self.req_store.get(req.rid)
+        if tracking_state is None:
+            logger.warning("Request %s not found in req_store for backbone continuation", req.rid)
+            return
+
+        # Accumulate text tokens
+        if not hasattr(tracking_state, "accumulated_text_tokens"):
+            tracking_state.accumulated_text_tokens = []
+        if req.generated_text_tokens is not None:
+            tracking_state.accumulated_text_tokens.extend(req.generated_text_tokens.tolist())
+
+        # Accumulate audio tokens if present
+        if not hasattr(tracking_state, "accumulated_audio_tokens"):
+            tracking_state.accumulated_audio_tokens = []
+        if req.generated_audio_tokens is not None:
+            tracking_state.accumulated_audio_tokens.append(req.generated_audio_tokens)
+
+        # Check max tokens limit
+        max_tokens = getattr(req, "max_new_tokens", 256)
+        if len(tracking_state.accumulated_text_tokens) >= max_tokens:
+            logger.info(
+                "Request %s reached max tokens limit (%d), finishing generation",
+                req.rid,
+                max_tokens,
+            )
+            req.is_finished = True
+            req.generated_text_tokens = tracking_state.accumulated_text_tokens
+            # Forward to next stage or detokenizer
+            if self.stage_configs[stage_idx].final_output:
+                self.send_to_detokenizer.send_pyobj(req)
+                del self.req_store[req.rid]
+            else:
+                next_stage = stage_idx + 1
+                self.req_store[req.rid].current_stage = next_stage
+                stage_reqs = req.to_stage_reqs(self.stage_configs[next_stage].scheduler)
+                for stage_req in stage_reqs:
+                    self.in_queues[next_stage].put_nowait(stage_req)
+            return
+
+        # Build next step input and send back to backbone
+        try:
+            req.input_ids = req.build_next_step_input()
+            logger.info(
+                "Backbone continue for rid=%s, step=%d, input_ids shape=%s",
+                req.rid,
+                len(tracking_state.accumulated_text_tokens),
+                req.input_ids.shape if req.input_ids is not None else None,
+            )
+            self.in_queues[stage_idx].put_nowait(req)
+        except Exception as e:
+            logger.error("Failed to build next step input for rid=%s: %s", req.rid, e)
+            # Finish with what we have
+            req.is_finished = True
+            req.generated_text_tokens = tracking_state.accumulated_text_tokens
+            if self.stage_configs[stage_idx].final_output:
+                self.send_to_detokenizer.send_pyobj(req)
+                del self.req_store[req.rid]
 
 
 def run_global_scheduler_process(

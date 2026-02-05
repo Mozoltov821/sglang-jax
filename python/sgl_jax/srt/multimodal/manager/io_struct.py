@@ -51,30 +51,6 @@ class VideoResponse(BaseModel):
     path: str | None = None
 
 
-class AudioEncodeRequest(BaseModel):
-    audio_data: str  # base64 encoded audio
-    sample_rate: int = 24000
-    use_quantizer: bool = True
-    n_q: int | None = None
-
-
-class AudioDecodeRequest(BaseModel):
-    codes: list[list[int]]  # [n_q, seq_len]
-
-
-class AudioEncodeResponse(BaseModel):
-    id: str
-    codes: list[list[int]] | None = None
-    hidden_states_shape: list[int] | None = None
-
-
-class AudioDecodeResponse(BaseModel):
-    id: str
-    audio_data: str | None = None       # base64 编码的音频
-    url: str | None = None              # 文件路径 (当 save_output=True)
-    sample_rate: int = 24000
-
-
 class AudioGenerationRequest(BaseModel):
     audio_data: str
     prompt: str | None = None
@@ -102,6 +78,54 @@ class TTSResponse(BaseModel):
     audio_data: str | None = None       # base64 编码的音频
     url: str | None = None              # 文件路径 (当 save_output=True)
     sample_rate: int = 24000
+
+
+class ASRRequest(BaseModel):
+    """Automatic Speech Recognition request."""
+    audio_data: str | bytes                     # base64 编码的音频数据 或 原始字节
+    sample_rate: int = 24000            # 采样率，默认 24kHz
+    prompt: str = "请转录这段音频"       # 指令/提示词，引导模型进行转录
+
+
+class ASRResponse(BaseModel):
+    """Automatic Speech Recognition response."""
+    id: str                             # 请求 ID
+    text: str                           # 转录的文本内容
+
+
+# === OpenAI Audio Chat Compatibility ===
+
+class InputAudio(BaseModel):
+    data: str | None = None       # Base64 encoded audio bytes
+    url: str | None = None        # URL to audio file
+    format: str                   # wav, mp3
+
+class ContentPart(BaseModel):
+    type: str        # "text" | "input_audio"
+    text: str | None = None
+    input_audio: InputAudio | None = None
+
+class ChatMessage(BaseModel):
+    role: str        # "user", "assistant", "system"
+    content: str | list[ContentPart]
+
+class AudioOutputConfig(BaseModel):
+    voice: str       # e.g. "alloy"
+    format: str      # "wav", "mp3"
+
+class GenerateOpenAIAudioInput(BaseModel):
+    """
+    OpenAI-compatible request body for multimodal audio chat.
+    Maps to /api/v1/chat/completions
+    """
+    model: str
+    messages: list[ChatMessage]
+    modalities: list[str] | None = ["text", "audio"]
+    audio: AudioOutputConfig | None = None
+    max_tokens: int | None = 2048
+    temperature: float | None = 1.0
+    top_p: float | None = 1.0
+    stream: bool = False
 
 
 class DataType(Enum):

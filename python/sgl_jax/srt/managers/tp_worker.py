@@ -511,7 +511,7 @@ class ModelWorker:
             forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
-
+        logger.info("forward_batch: %s",forward_batch)
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,

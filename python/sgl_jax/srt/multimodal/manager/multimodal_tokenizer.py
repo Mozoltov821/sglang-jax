@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import dataclasses
+import io
 import logging
 import os
 import signal
@@ -12,20 +13,20 @@ from typing import Any
 import fastapi
 import numpy as np
 import psutil
+import requests
 import setproctitle
 from transformers import AutoImageProcessor
 
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
-    AudioDecodeRequest,
-    AudioDecodeResponse,
-    AudioEncodeRequest,
-    AudioEncodeResponse,
+    ASRRequest,
+    ASRResponse,
     AudioGenerationRequest,
     AudioGenerationResponse,
     DataType,
     GenerateMMReqInput,
+    GenerateOpenAIAudioInput,
     TokenizedGenerateMMReqInput,
     TTSRequest,
     TTSResponse,
@@ -67,23 +68,21 @@ class MultimodalTokenizer(TokenizerManager):
     def __init__(self, server_args, port_args):
         """Initialize tokenizer, processor and result dispatcher.
 
-        Loads an image processor (best-effort), initializes an in-memory
+        Loads processors for different modalities, initializes an in-memory
         map `rid_to_state` to track request state objects, and prepares a
         result dispatcher that routes batches of outputs back to
         `_handle_batch_output`.
         """
         super().__init__(server_args, port_args)
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
-        # Use slow image processor to avoid torchvision dependency warning
-        try:
-            self.mm_processor = AutoImageProcessor.from_pretrained(
-                server_args.model_path, use_fast=False
-            )
-        except Exception:
-            logger.warning("Failed to load image processor from %s", server_args.model_path)
+        
+        # Initialize processors for vision and audio
+        self.image_processor = None
+        self._init_image_processor(server_args.model_path)
 
         # Initialize audio processor (WhisperFeatureExtractor) for audio models
         self.audio_processor = None
+        self.audio_config = {}
         self._init_audio_processor(server_args.model_path)
 
         self.rid_to_state: dict[str, MMReqState] = {}
@@ -100,11 +99,21 @@ class MultimodalTokenizer(TokenizerManager):
             ]
         )
 
-    def _init_audio_processor(self, model_path: str):
-        """Initialize audio processor for audio models using transformers FeatureExtractor.
+    def _init_image_processor(self, model_path: str):
+        """Initialize image processor for multimodal models."""
+        try:
+            # Use slow image processor to avoid torchvision dependency warning
+            self.image_processor = AutoImageProcessor.from_pretrained(
+                model_path, use_fast=False
+            )
+        except Exception:
+            logger.warning("Failed to load image processor from %s", model_path)
 
-        This loads the audio config and initializes a WhisperFeatureExtractor-like processor
-        that uses numpy (not JAX) for mel spectrogram computation.
+    def _init_audio_processor(self, model_path: str):
+        """Initialize audio processor for audio models using transformers audio_utils.
+
+        This loads the audio config and initializes mel filter bank and window function
+        that match the official MiMo Audio implementation (power=1.0, log_mel="log").
         """
         import json
         import os
@@ -151,64 +160,169 @@ class MultimodalTokenizer(TokenizerManager):
                     config = json.load(f)
 
                 if "n_mels" in config and "sampling_rate" in config:
-                    # Use transformers WhisperFeatureExtractor (numpy-based, no JAX dependency)
-                    from transformers import WhisperFeatureExtractor
+                    self.audio_config = config
+                    # Use transformers audio_utils (no torch dependency, matches official MiMo)
+                    from transformers.audio_utils import mel_filter_bank, window_function
 
-                    self.audio_processor = WhisperFeatureExtractor(
-                        feature_size=config.get("n_mels", 128),
-                        sampling_rate=config.get("sampling_rate", 24000),
-                        hop_length=config.get("hop_length", 240),
-                        n_fft=config.get("nfft", 960),
-                        padding_value=0.0,
-                        return_attention_mask=False,
+                    # Get parameters from config (with MiMo Audio defaults)
+                    sample_rate = config.get("sampling_rate", 24000)
+                    n_fft = config.get("nfft", 960)
+                    hop_length = config.get("hop_length", 240)
+                    win_length = config.get("window_size", 960)
+                    f_min = config.get("fmin", 0)
+                    f_max = config.get("fmax", sample_rate // 2)  # Default to Nyquist
+                    n_mels = config.get("n_mels", 128)
+
+                    # Create mel filter bank
+                    # Use HTK mel scale and no norm to match torchaudio defaults
+                    self.mel_filters = mel_filter_bank(
+                        num_frequency_bins=n_fft // 2 + 1,
+                        num_mel_filters=n_mels,
+                        min_frequency=f_min,
+                        max_frequency=f_max,
+                        sampling_rate=sample_rate,
+                        norm=None,  # Match torchaudio default (no area normalization)
+                        mel_scale="htk",  # Match torchaudio default
                     )
-                    logger.warning("Initialized WhisperFeatureExtractor from %s", try_path)
+
+                    # Create window function
+                    self.window = window_function(win_length, "hann")
+
+                    # Store parameters for spectrogram computation
+                    self.mel_params = {
+                        "sample_rate": sample_rate,
+                        "n_fft": n_fft,
+                        "hop_length": hop_length,
+                        "win_length": win_length,
+                    }
+
+                    # Store sampling rate for resampling
+                    self.audio_processor = type('AudioProcessor', (), {'sampling_rate': sample_rate})()
+                    logger.warning(
+                        "Initialized transformers audio_utils from %s: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
+                        try_path, sample_rate, n_fft, hop_length, n_mels
+                    )
                     return
             except Exception as e:
                 logger.warning("Failed to init audio processor from %s: %s", try_path, e)
                 import traceback
                 logger.warning("Traceback: %s", traceback.format_exc())
 
-        logger.warning("Could not initialize audio processor")
+        # Fallback: initialize with default MiMo Audio parameters
+        logger.warning("Could not load config, using default MiMo Audio parameters")
+        self._init_default_mel_processor()
 
-    def _preprocess_audio_to_mel(self, audio_array: np.ndarray) -> tuple:
-        """Convert raw audio waveform to mel spectrogram using WhisperFeatureExtractor.
+    def _init_default_mel_processor(self):
+        """Initialize mel processor with default MiMo Audio parameters.
+
+        Uses the official MiMo Audio parameters:
+        - sample_rate: 24000
+        - n_fft: 960
+        - hop_length: 240
+        - win_length: 960
+        - f_min: 0
+        - f_max: 12000 (Nyquist)
+        - n_mels: 128
+        """
+        from transformers.audio_utils import mel_filter_bank, window_function
+
+        # Default MiMo Audio parameters
+        sample_rate = 24000
+        n_fft = 960
+        hop_length = 240
+        win_length = 960
+        f_min = 0
+        f_max = 12000  # Nyquist frequency
+        n_mels = 128
+
+        # Create mel filter bank
+        # Use HTK mel scale and no norm to match torchaudio defaults
+        self.mel_filters = mel_filter_bank(
+            num_frequency_bins=n_fft // 2 + 1,
+            num_mel_filters=n_mels,
+            min_frequency=f_min,
+            max_frequency=f_max,
+            sampling_rate=sample_rate,
+            norm=None,  # Match torchaudio default (no area normalization)
+            mel_scale="htk",  # Match torchaudio default
+        )
+
+        # Create window function
+        self.window = window_function(win_length, "hann")
+
+        # Store parameters for spectrogram computation
+        self.mel_params = {
+            "sample_rate": sample_rate,
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "win_length": win_length,
+        }
+
+        # Store sampling rate for resampling
+        self.audio_processor = type('AudioProcessor', (), {'sampling_rate': sample_rate})()
+        logger.warning(
+            "Initialized transformers audio_utils with defaults: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
+            sample_rate, n_fft, hop_length, n_mels
+        )
+
+    def _preprocess_audio_to_mel(self, audio_array: np.ndarray, input_sr: int = None) -> tuple:
+        """Convert raw audio waveform to mel spectrogram using transformers audio_utils.
+
+        This matches the official MiMo Audio implementation:
+        - Uses power=1.0 (amplitude spectrogram)
+        - Applies natural log via log_mel="log"
+        - Returns mel spectrogram in [batch, time, n_mels] format
 
         Args:
             audio_array: Raw audio waveform as numpy array, shape (samples,).
+            input_sr: Input audio sample rate. If different from target rate, will resample.
 
         Returns:
             Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
             mel_spectrogram shape: [batch, time, n_mels]
-            Note: Returns numpy arrays to avoid JAX initialization in tokenizer process.
         """
-        if self.audio_processor is None:
-            raise ValueError("Audio processor not initialized. Cannot preprocess audio.")
+        from transformers.audio_utils import spectrogram
 
-        # WhisperFeatureExtractor expects 1D array or list of 1D arrays
+        if not hasattr(self, 'mel_filters') or self.mel_filters is None:
+            raise ValueError("Mel filter bank not initialized. Cannot preprocess audio.")
+
+        # Ensure 1D array
         if audio_array.ndim == 2:
             audio_array = audio_array.squeeze(0)
 
-        # Extract mel features using WhisperFeatureExtractor
-        # IMPORTANT: Set padding=False to prevent automatic padding to 30 seconds
-        # Returns dict with 'input_features' key, shape [batch, n_mels, time]
-        features = self.audio_processor(
-            audio_array,
-            sampling_rate=self.audio_processor.sampling_rate,
-            return_tensors="np",
-            padding=False,  # Do not pad to fixed length
-        )
-        mels = features["input_features"]  # shape: [batch, n_mels, time]
+        # Resample if input sample rate differs from target rate
+        target_sr = self.audio_processor.sampling_rate
+        if input_sr is not None and input_sr != target_sr:
+            audio_array = self._resample_audio(audio_array, input_sr, target_sr)
 
-        # Transpose to [batch, time, n_mels] - stay in numpy, no JAX
-        mels = np.transpose(mels, (0, 2, 1))  # [batch, time, n_mels]
+        # Compute mel spectrogram with power=1.0 (matches official MiMo)
+        # spectrogram() returns [n_mels, time] with log_mel applied
+        mels = spectrogram(
+            waveform=audio_array,
+            window=self.window,
+            frame_length=self.mel_params["n_fft"],
+            hop_length=self.mel_params["hop_length"],
+            fft_length=self.mel_params["n_fft"],
+            power=1.0,  # Amplitude spectrogram (matches official MiMo)
+            center=True,
+            mel_filters=self.mel_filters,
+            log_mel="log",  # Natural logarithm (matches official torch.log)
+            mel_floor=1e-7,  # Matches official torch.clip(spec, min=1e-7)
+        )
+
+        # mels is [n_mels, time], transpose to [1, time, n_mels] for model input
+        mels = mels.T[None, :, :]  # [1, time, n_mels]
         input_lens = np.array([mels.shape[1]])
 
-        logger.warning(
-            "Audio preprocessing: input_samples=%d, mel_shape=%s, input_lens=%s",
-            len(audio_array) if audio_array.ndim == 1 else audio_array.shape[-1],
+        logger.info(
+            "Audio preprocessing (transformers audio_utils): input_samples=%d, mel_shape=%s, input_lens=%s",
+            len(audio_array),
             mels.shape,
             input_lens,
+        )
+        logger.info(
+            "  Mel stats: min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
+            mels.min(), mels.max(), mels.mean(), mels.std()
         )
 
         return mels, input_lens
@@ -229,10 +343,30 @@ class MultimodalTokenizer(TokenizerManager):
 
                 out_data = {"success": True, "meta_info": {}}
                 if hasattr(req, "audio_mode") and req.audio_mode is not None:
-                    if req.audio_mode == "encode" and req.output is not None:
-                        out_data["codes"] = req.output.tolist() if hasattr(req.output, "tolist") else req.output
-                    elif req.audio_mode == "decode" and req.output is not None:
-                        out_data["audio_data"] = req.output
+                    if req.audio_mode in ("asr", "audio_understanding") and req.generated_text_tokens is not None:
+                        # Decode generated text tokens to string
+                        tokens = req.generated_text_tokens
+                        if hasattr(tokens, "tolist"):
+                            tokens = tokens.tolist()
+                        
+                        # Store raw tokens for usage calculation
+                        out_data["generated_text_tokens"] = tokens
+                        
+                        logger.info("ASR generated tokens: %s", tokens)
+                        
+                        if self.tokenizer:
+                            # Use tokenizer to decode
+                            decoded_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+                            if not decoded_text and tokens:
+                                # Debug info if decode results in empty string
+                                debug_tokens = tokens[:20]
+                                decoded_text = f"[DEBUG: Empty Decode. Tokens: {debug_tokens}...]"
+                            out_data["text"] = decoded_text
+                            logger.info("ASR decoded text: '%s'", out_data["text"])
+                        else:
+                            # Fallback if tokenizer not available (unlikely)
+                            out_data["text"] = str(tokens)
+                            logger.warning("Tokenizer not initialized, returning raw tokens for ASR")
 
                 self.rid_to_state[req.rid].out_list = [out_data]
             else:
@@ -443,142 +577,6 @@ class MultimodalTokenizer(TokenizerManager):
                         f"Request is disconnected from the client side. Abort request rid={state.rid}"
                     )
 
-    async def encode_audio(
-        self,
-        obj: AudioEncodeRequest,
-        request: fastapi.Request | None = None,
-    ):
-        """Encode audio data to codes using the audio tokenizer.
-
-        Args:
-            obj: AudioEncodeRequest containing base64 encoded audio data.
-            request: FastAPI request object for disconnect handling.
-
-        Returns:
-            AudioEncodeResponse containing the encoded codes.
-        """
-        created_time = time.time()
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._updating)
-
-        self.auto_create_handle_loop()
-
-        rid = uuid.uuid4().hex
-
-        if obj.audio_data:
-            audio_bytes = base64.b64decode(obj.audio_data)
-            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-        else:
-            audio_array = np.zeros((24000,), dtype=np.float32)
-
-        # Preprocess audio to mel spectrogram in tokenizer
-        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
-
-        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-
-        audio_req = Req(
-            rid=rid,
-            mel_input=mel_input,
-            mel_input_lens=mel_input_lens,
-            audio_mode="encode",
-            use_quantizer=obj.use_quantizer,
-            n_q=obj.n_q,
-            sample_rate=obj.sample_rate,
-            data_type=DataType.AUDIO,
-        )
-
-        state = MMReqState(
-            rid=rid,
-            out_list=[],
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=created_time,
-        )
-        self.rid_to_state[rid] = state
-
-        self.send_to_scheduler.send_pyobj(audio_req)
-
-        try:
-            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
-        except TimeoutError:
-            raise ValueError(f"Audio encode request timed out for rid={rid}") from None
-
-        del self.rid_to_state[rid]
-
-        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
-
-        return AudioEncodeResponse(
-            id=rid,
-            codes=out.get("codes"),
-            hidden_states_shape=out.get("hidden_states_shape"),
-        )
-
-    async def decode_audio(
-        self,
-        obj: AudioDecodeRequest,
-        request: fastapi.Request | None = None,
-    ):
-        """Decode codes to audio data using the audio tokenizer.
-
-        Args:
-            obj: AudioDecodeRequest containing the codes to decode.
-            request: FastAPI request object for disconnect handling.
-
-        Returns:
-            AudioDecodeResponse containing base64 encoded audio data.
-        """
-        created_time = time.time()
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._updating)
-
-        self.auto_create_handle_loop()
-
-        rid = uuid.uuid4().hex
-
-        codes_array = np.array(obj.codes, dtype=np.int32)
-
-        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-
-        audio_req = Req(
-            rid=rid,
-            codes=codes_array,
-            audio_mode="decode",
-            data_type=DataType.AUDIO,
-        )
-
-        state = MMReqState(
-            rid=rid,
-            out_list=[],
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=created_time,
-        )
-        self.rid_to_state[rid] = state
-
-        self.send_to_scheduler.send_pyobj(audio_req)
-
-        try:
-            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
-        except TimeoutError:
-            raise ValueError(f"Audio decode request timed out for rid={rid}") from None
-
-        del self.rid_to_state[rid]
-
-        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
-
-        audio_data_b64 = None
-        if out.get("audio_data") is not None:
-            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
-            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-        return AudioDecodeResponse(
-            id=rid,
-            audio_data=audio_data_b64,
-            sample_rate=24000,
-        )
-
     async def generate_audio(
         self,
         obj: AudioGenerationRequest,
@@ -735,6 +733,365 @@ class MultimodalTokenizer(TokenizerManager):
             url=url,
             sample_rate=24000,
         )
+
+    def _load_audio_from_bytes(self, audio_bytes: bytes, target_sr: int = 24000) -> np.ndarray:
+        """Load audio from bytes (wav, mp3, etc.) and resample to target_sr.
+
+        Uses soundfile for loading and torchaudio for resampling to match
+        the official MiMo Audio implementation.
+
+        Note: librosa.load produces different resampling results that cause
+        ~2.5% of mel spectrogram values to hit the floor, affecting ASR accuracy.
+        """
+        import soundfile as sf
+        import torch
+        import torchaudio
+
+        # Check if it's a valid audio file format
+        if audio_bytes[:4] == b'RIFF':
+            logger.debug("Detected WAV format (RIFF header)")
+        elif audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+            logger.debug("Detected MP3 format")
+        elif audio_bytes[:4] == b'fLaC':
+            logger.debug("Detected FLAC format")
+        elif audio_bytes[:4] == b'OggS':
+            logger.debug("Detected OGG format")
+        else:
+            logger.warning("Unknown audio format, first 4 bytes: %s", audio_bytes[:4].hex())
+
+        # Load audio with soundfile (returns numpy array)
+        with io.BytesIO(audio_bytes) as f:
+            audio_array, orig_sr = sf.read(f)
+
+        # Convert to torch tensor for resampling
+        audio_tensor = torch.from_numpy(audio_array).float()
+
+        # Handle stereo -> mono (average channels like official impl)
+        if audio_tensor.ndim == 2:
+            audio_tensor = audio_tensor.mean(dim=1)
+
+        # Resample using torchaudio (matches official MiMo implementation)
+        if orig_sr != target_sr:
+            audio_tensor = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
+            logger.debug("Resampled audio from %d Hz to %d Hz", orig_sr, target_sr)
+
+        audio_array = audio_tensor.numpy()
+        logger.debug("Audio loaded: orig_sr=%d, target_sr=%d, samples=%d",
+                     orig_sr, target_sr, len(audio_array))
+        return audio_array
+
+    def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """Resample audio to target sample rate using torchaudio.
+
+        Uses torchaudio.functional.resample to match official MiMo implementation.
+
+        Args:
+            audio: Input audio array.
+            orig_sr: Original sample rate.
+            target_sr: Target sample rate.
+
+        Returns:
+            Resampled audio array.
+        """
+        if orig_sr == target_sr:
+            return audio
+
+        import torch
+        import torchaudio
+
+        audio_tensor = torch.from_numpy(audio).float()
+        resampled = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
+        logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
+                    orig_sr, target_sr, len(audio), len(resampled))
+        return resampled.numpy().astype(np.float32)
+
+    async def asr(
+        self,
+        obj: ASRRequest,
+        request: fastapi.Request | None = None,
+    ):
+        """Automatic Speech Recognition: convert audio to text.
+
+        Args:
+            obj: ASRRequest containing audio data and optional prompt.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            ASRResponse containing the transcribed text.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        # Decode audio data from base64 or use raw bytes
+        if obj.audio_data:
+            if isinstance(obj.audio_data, str):
+                try:
+                    audio_bytes = base64.b64decode(obj.audio_data)
+                except Exception:
+                    # If not base64, maybe it's a file path? For now assume base64 error
+                    raise ValueError("Invalid base64 string in audio_data")
+            else:
+                audio_bytes = obj.audio_data
+
+            # Debug: log audio bytes info
+            logger.info("=" * 60)
+            logger.info("ASR Audio Loading Debug:")
+            logger.info("  audio_bytes size: %d bytes", len(audio_bytes))
+            logger.info("  audio_bytes first 16 bytes: %s", audio_bytes[:16].hex())
+            logger.info("  target sample_rate: %d Hz", obj.sample_rate)
+
+            # Use smart loader to handle WAV/MP3 or Raw PCM
+            audio_array = self._load_audio_from_bytes(audio_bytes, target_sr=obj.sample_rate)
+
+            # Debug: log audio array info
+            logger.info("  audio_array shape: %s", audio_array.shape)
+            logger.info("  audio_array dtype: %s", audio_array.dtype)
+            logger.info("  audio_array min: %.6f, max: %.6f", audio_array.min(), audio_array.max())
+            logger.info("  audio_array mean: %.6f, std: %.6f", audio_array.mean(), audio_array.std())
+            logger.info("  audio duration: %.3f seconds", len(audio_array) / obj.sample_rate)
+            logger.info("=" * 60)
+        else:
+            raise ValueError("audio_data is required for ASR")
+
+        # Preprocess audio to mel spectrogram
+        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
+        # Tokenize the prompt (instruction)
+        # Split into prefix (before audio) and suffix (after audio) like audio_understanding
+        prefix_ids = None
+        suffix_ids = None
+        if obj.prompt and self.tokenizer is not None:
+            # Official MiMo format: [prefix] + [audio] + [suffix]
+            # prefix: <|im_start|>user\n
+            # suffix: {prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n
+            prefix_text = "<|im_start|>user\n"
+            suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n"
+            # suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
+
+            try:
+                prefix_ids = self.tokenizer(prefix_text)["input_ids"]
+                suffix_ids = self.tokenizer(suffix_text)["input_ids"]
+
+                # Dump tokenizer output for debugging
+                logger.info("=" * 60)
+                logger.info("ASR Tokenizer Output Dump:")
+                logger.info("  prefix_text: %r", prefix_text)
+                logger.info("  prefix_ids: %s", prefix_ids)
+                logger.info("  prefix decoded: %r", self.tokenizer.decode(prefix_ids))
+                logger.info("  suffix_text: %r", suffix_text)
+                logger.info("  suffix_ids: %s", suffix_ids)
+                logger.info("  suffix decoded: %r", self.tokenizer.decode(suffix_ids))
+                logger.info("=" * 60)
+            except Exception as e:
+                logger.warning("Failed to tokenize ASR prompt: %s", e)
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        asr_req = Req(
+            rid=rid,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
+            audio_mode="asr",
+            sample_rate=obj.sample_rate,
+            data_type=DataType.AUDIO,
+            text_input_ids=suffix_ids,
+            prompt_input_ids=prefix_ids,
+            prompt=obj.prompt,
+            n_q=8,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(asr_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"ASR request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        # Decode the generated text tokens to text
+        text = ""
+        if out.get("text") is not None:
+            text = out["text"]
+        elif out.get("generated_text_tokens") is not None and self.tokenizer is not None:
+            tokens = out["generated_text_tokens"]
+            if hasattr(tokens, "tolist"):
+                tokens = tokens.tolist()
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+        return ASRResponse(
+            id=rid,
+            text=text,
+        )
+
+    async def chat_completion_audio(
+        self,
+        obj: GenerateOpenAIAudioInput,
+        request: fastapi.Request | None = None,
+    ):
+        """OpenAI-compatible chat completion for multimodal audio.
+
+        Args:
+            obj: GenerateOpenAIAudioInput containing messages and audio config.
+            request: FastAPI request object.
+
+        Returns:
+            A dict formatted as an OpenAI Chat Completion response.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        # 1. Parse messages to extract prompt and audio
+        prompt_text = ""
+        audio_data_bytes = None
+        
+        for msg in obj.messages:
+            if isinstance(msg.content, str):
+                if msg.role == "user":
+                    prompt_text += msg.content + "\n"
+            elif isinstance(msg.content, list):
+                for part in msg.content:
+                    if part.type == "text":
+                        prompt_text += part.text + "\n"
+                    elif part.type == "input_audio":
+                        # We only support one audio input for now (MiMo Audio limitation)
+                        if part.input_audio:
+                            if part.input_audio.data:
+                                try:
+                                    audio_data_bytes = base64.b64decode(part.input_audio.data)
+                                except Exception:
+                                    logger.warning("Failed to decode base64 audio in chat_completion")
+                            elif part.input_audio.url:
+                                try:
+                                    # Download audio from URL
+                                    logger.info("Downloading audio from URL: %s", part.input_audio.url)
+                                    # Using a timeout to prevent hanging
+                                    resp = requests.get(part.input_audio.url, timeout=30)
+                                    resp.raise_for_status()
+                                    audio_data_bytes = resp.content
+                                    logger.info("Downloaded %d bytes", len(audio_data_bytes))
+                                except Exception as e:
+                                    logger.warning("Failed to download audio from URL: %s", e)
+
+        # 2. Construct Prompt Segments (Manual construction for precise Audio placement)
+        # Official MiMo format: <|im_start|>user\n[AUDIO]{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n
+        # Audio comes FIRST, then instruction/question
+
+        prefix_text = "<|im_start|>user\n"
+        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
+        
+        prefix_ids = []
+        suffix_ids = []
+        
+        if self.tokenizer:
+            try:
+                # Tokenize prefix
+                prefix_ids = self.tokenizer(prefix_text)["input_ids"]
+                # Tokenize suffix
+                suffix_ids = self.tokenizer(suffix_text)["input_ids"]
+            except Exception as e:
+                logger.warning("Tokenization error in chat_completion_audio: %s", e)
+
+        # 3. Process audio if present
+        mel_input = None
+        mel_input_lens = None
+        if audio_data_bytes:
+            # Use our smart loader (handles WAV/MP3/etc.)
+            audio_array = self._load_audio_from_bytes(audio_data_bytes)
+            mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
+        # 4. Create internal Req and send to scheduler
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+        
+        # We use audio_understanding mode for general chat with audio
+        internal_req = Req(
+            rid=rid,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
+            audio_mode="audio_understanding",
+            text_input_ids=suffix_ids,
+            prompt_input_ids=prefix_ids,
+            data_type=DataType.AUDIO,
+            sample_rate=24000,
+            prompt=prompt_text,
+            n_q=8,
+            max_new_tokens=obj.max_tokens or 256,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(internal_req)
+
+        # 5. Wait for result
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"Chat completion request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        # 6. Format response as OpenAI Chat Completion
+        result_text = out.get("text", "")
+        
+        # Extract raw tokens if text is empty (debug fallback)
+        if not result_text and out.get("generated_text_tokens") is not None and self.tokenizer is not None:
+            tokens = out["generated_text_tokens"]
+            if hasattr(tokens, "tolist"):
+                tokens = tokens.tolist()
+            result_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+        return {
+            "id": f"chatcmpl-{rid}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": obj.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": result_text,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(prefix_ids) + len(suffix_ids),
+                "completion_tokens": len(out.get("generated_text_tokens", [])),
+                "total_tokens": len(prefix_ids) + len(suffix_ids) + len(out.get("generated_text_tokens", [])),
+            }
+        }
 
 
 def run_multimodal_tokenizer_process(

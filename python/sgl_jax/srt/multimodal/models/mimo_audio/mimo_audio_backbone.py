@@ -1,15 +1,22 @@
 """MiMo Audio Backbone model implementation for sglang-jax."""
+# Forced sync update
 
 from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import Embed, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.models.qwen2 import Qwen2MLP, Qwen2Attention  # Reuse Qwen2 components
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
     MiMoAudioBackboneConfig,
@@ -21,59 +28,15 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone_weights_mappin
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 
-class MiMoAudioMLP(nnx.Module):
-    """MLP layer for MiMo Audio model."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        mesh: jax.sharding.Mesh,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ):
-        self.gate_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=intermediate_size,
-            kernel_axes=(None, "tensor"),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.up_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=intermediate_size,
-            kernel_axes=(None, "tensor"),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.down_proj = LinearBase(
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            kernel_axes=("tensor", None),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.act_fn = jax.nn.silu
-
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
-        gate, _ = self.gate_proj(hidden_states)
-        up, _ = self.up_proj(hidden_states)
-        intermediate = up * self.act_fn(gate)
-        output, _ = self.down_proj(intermediate)
-        return output
+# Note: MiMoAudioMLP has been removed. We now use Qwen2MLP directly.
+# The implementations are identical (SwiGLU with gate_proj, up_proj, down_proj).
 
 
-class MiMoAudioAttention(nnx.Module):
-    """Standard attention layer for MiMo Audio model.
+class MiMoAudioAttention(Qwen2Attention):
+    """Attention layer that extends Qwen2Attention with standard attention support.
 
-    Unlike RadixAttention used in LLM serving, this uses standard attention
-    since audio token generation doesn't require KV cache sharing.
-
-    Supports two cache modes:
-    - Fixed-size cache with position index (for patch_decoder with fixed steps)
-    - Dynamic concatenation cache (for main transformer)
+    Inherits Q/K/V/O projections, RoPE, and RadixAttention from Qwen2Attention.
+    Adds a second branch for standard attention (no KV cache) used by Patch Encoder/Decoder.
     """
 
     def __init__(
@@ -85,164 +48,114 @@ class MiMoAudioAttention(nnx.Module):
         max_position_embeddings: int,
         rope_theta: float,
         mesh: jax.sharding.Mesh,
+        layer_id: int = 0,
         use_bias: bool = True,
         use_causal_mask: bool = True,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.use_causal_mask = use_causal_mask
-        self.scaling = head_dim**-0.5
-
-        self.q_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=num_heads * head_dim,
-            use_bias=use_bias,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.k_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=num_kv_heads * head_dim,
-            use_bias=use_bias,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.v_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=num_kv_heads * head_dim,
-            use_bias=use_bias,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.o_proj = LinearBase(
-            input_size=num_heads * head_dim,
-            output_size=hidden_size,
-            use_bias=False,
-            kernel_axes=("tensor", None),
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-
-        self.rotary_emb = RotaryEmbedding(
-            head_size=head_dim,
-            rotary_dim=head_dim,
+        # Call parent class __init__ to set up Q/K/V/O projections, RoPE, and RadixAttention
+        super().__init__(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             max_position_embeddings=max_position_embeddings,
-            base=rope_theta,
-            is_neox_style=True,
+            mesh=mesh,
+            rope_theta=rope_theta,
+            head_dim=head_dim,
+            layer_id=layer_id,
             dtype=dtype,
         )
+        # Store additional attributes for standard attention branch
+        self.use_causal_mask = use_causal_mask
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+
+        # Override Q/K/V projections if use_bias differs from Qwen2's default (True)
+        if not use_bias:
+            self.q_proj = LinearBase(
+                input_size=hidden_size,
+                output_size=num_heads * self.head_dim,
+                use_bias=False,
+                kernel_axes=(None, "tensor"),
+                params_dtype=dtype,
+                mesh=mesh,
+            )
+            self.k_proj = LinearBase(
+                input_size=hidden_size,
+                output_size=num_kv_heads * self.head_dim,
+                use_bias=False,
+                kernel_axes=(None, "tensor"),
+                params_dtype=dtype,
+                mesh=mesh,
+            )
+            self.v_proj = LinearBase(
+                input_size=hidden_size,
+                output_size=num_kv_heads * self.head_dim,
+                use_bias=False,
+                kernel_axes=(None, "tensor"),
+                params_dtype=dtype,
+                mesh=mesh,
+            )
 
     def __call__(
         self,
         hidden_states: jax.Array,
         positions: jax.Array,
-        attention_mask: Optional[jax.Array] = None,
-        cache: Optional[Tuple[jax.Array, jax.Array, int]] = None,
-    ) -> Tuple[jax.Array, Optional[Tuple[jax.Array, jax.Array, int]]]:
-        """
-        Args:
-            hidden_states: [B, T, hidden_size]
-            positions: [B, T] or [T]
-            attention_mask: Optional attention mask
-            cache: Optional (key_cache, value_cache, cache_pos) for fixed-size cache
-                   where cache_pos is the current write position
+        forward_batch: Optional[ForwardBatch] = None,
+        token_to_kv_pool: Optional[KVCache] = None,
+    ) -> Tuple[jax.Array, Optional[jax.Array]]:
+        """Forward pass with two branches: RadixAttention or Standard Attention.
 
-        Returns:
-            output: [B, T, hidden_size]
-            new_cache: Updated cache tuple (k, v, new_pos)
+        Branch 1 (RadixAttention): Used when token_to_kv_pool is provided (main model).
+        Branch 2 (Standard): Used when token_to_kv_pool is None (Patch Encoder/Decoder).
         """
+        # Branch 1: RadixAttention (inherited from Qwen2Attention)
+        if token_to_kv_pool is not None:
+            return super().__call__(positions, hidden_states, forward_batch, token_to_kv_pool)
+
+        # Branch 2: Standard Attention (Stateless / Patch Encoder/Decoder)
         batch_size, seq_len, _ = hidden_states.shape
 
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        # Reshape to [B, T, num_heads, head_dim]
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        q = q.reshape(batch_size, seq_len, self.q_head_num, self.head_dim)
+        k = k.reshape(batch_size, seq_len, self.kv_head_num, self.head_dim)
+        v = v.reshape(batch_size, seq_len, self.kv_head_num, self.head_dim)
 
-        # Apply rotary embeddings
-        q_flat = q.reshape(-1, self.num_heads, self.head_dim)
-        k_flat = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        # RoPE
         positions_flat = positions.reshape(-1) if positions.ndim > 1 else jnp.tile(positions, batch_size)
+        q_flat = q.reshape(-1, self.q_head_num, self.head_dim)
+        k_flat = k.reshape(-1, self.kv_head_num, self.head_dim)
+        q_rot, k_rot = self.rotary_emb(positions_flat, q_flat, k_flat)
+        q = q_rot.reshape(batch_size, seq_len, self.q_head_num, self.head_dim)
+        k = k_rot.reshape(batch_size, seq_len, self.kv_head_num, self.head_dim)
 
-        q_flat, k_flat = self.rotary_emb(positions_flat, q_flat, k_flat)
+        # GQA: Repeat KV heads if needed
+        if self.kv_head_num < self.q_head_num:
+            k = jnp.repeat(k, self.q_head_num // self.kv_head_num, axis=2)
+            v = jnp.repeat(v, self.q_head_num // self.kv_head_num, axis=2)
 
-        q = q_flat.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k_flat.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        # Transpose to [B, H, T, D]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
-        # Handle KV cache
-        if cache is not None:
-            cached_k, cached_v, cache_pos = cache
-            # Force k/v to be replicated to match cache sharding
-            k = jnp.asarray(k)
-            v = jnp.asarray(v)
-            # Update cache at current position using fixed-size indexing
-            cached_k = jax.lax.dynamic_update_slice(
-                cached_k, k, (0, cache_pos, 0, 0)
-            )
-            cached_v = jax.lax.dynamic_update_slice(
-                cached_v, v, (0, cache_pos, 0, 0)
-            )
-            new_cache_pos = cache_pos + seq_len
-            # Use all cached KV up to current position for attention
-            kv_len = new_cache_pos
-            k_for_attn = jax.lax.dynamic_slice(
-                cached_k, (0, 0, 0, 0), (batch_size, kv_len, self.num_kv_heads, self.head_dim)
-            )
-            v_for_attn = jax.lax.dynamic_slice(
-                cached_v, (0, 0, 0, 0), (batch_size, kv_len, self.num_kv_heads, self.head_dim)
-            )
-            new_cache = (cached_k, cached_v, new_cache_pos)
-        else:
-            k_for_attn = k
-            v_for_attn = v
-            kv_len = seq_len
-            new_cache = None
-
-        # Repeat KV heads if needed (GQA)
-        if self.num_kv_heads < self.num_heads:
-            repeat_factor = self.num_heads // self.num_kv_heads
-            k_for_attn = jnp.repeat(k_for_attn, repeat_factor, axis=2)
-            v_for_attn = jnp.repeat(v_for_attn, repeat_factor, axis=2)
-
-        # Compute attention: [B, num_heads, T_q, T_kv]
-        q = q.transpose(0, 2, 1, 3)  # [B, num_heads, T, head_dim]
-        k_for_attn = k_for_attn.transpose(0, 2, 1, 3)
-        v_for_attn = v_for_attn.transpose(0, 2, 1, 3)
-
-        attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k_for_attn) * self.scaling
+        # Compute attention scores
+        attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scaling
 
         # Apply causal mask if needed
         if self.use_causal_mask:
-            # For cached attention, we need to mask based on absolute positions
-            if cache is not None:
-                # Query attends to all positions up to and including its own
-                causal_mask = jnp.tril(jnp.ones((seq_len, kv_len), dtype=jnp.bool_), k=kv_len - seq_len)
-            else:
-                causal_mask = jnp.tril(jnp.ones((seq_len, kv_len), dtype=jnp.bool_))
+            causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
             attn_weights = jnp.where(causal_mask[None, None, :, :], attn_weights, -jnp.inf)
 
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(v_for_attn.dtype)
-
-        # Apply attention to values
-        attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v_for_attn)
-
-        # Reshape back: [B, T, num_heads * head_dim]
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(v.dtype)
+        attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v)
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
 
         output, _ = self.o_proj(attn_output)
-        return output, new_cache
+        return output, None
 
 
 class MiMoAudioDecoderLayer(nnx.Module):
@@ -259,6 +172,7 @@ class MiMoAudioDecoderLayer(nnx.Module):
         rope_theta: float,
         rms_norm_eps: float,
         mesh: jax.sharding.Mesh,
+        layer_id: int = 0,
         use_bias: bool = True,
         use_causal_mask: bool = True,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -271,14 +185,16 @@ class MiMoAudioDecoderLayer(nnx.Module):
             max_position_embeddings=max_position_embeddings,
             rope_theta=rope_theta,
             mesh=mesh,
+            layer_id=layer_id,
             use_bias=use_bias,
             use_causal_mask=use_causal_mask,
             dtype=dtype,
         )
-        self.mlp = MiMoAudioMLP(
+        self.mlp = Qwen2MLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             mesh=mesh,
+            layer_id=layer_id,
             dtype=dtype,
         )
         self.input_layernorm = RMSNorm(
@@ -296,24 +212,31 @@ class MiMoAudioDecoderLayer(nnx.Module):
         self,
         hidden_states: jax.Array,
         positions: jax.Array,
-        attention_mask: Optional[jax.Array] = None,
-        cache: Optional[Tuple[jax.Array, jax.Array, int]] = None,
-    ) -> Tuple[jax.Array, Optional[Tuple[jax.Array, jax.Array, int]]]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        forward_batch: Optional[ForwardBatch] = None,
+        token_to_kv_pool: Optional[KVCache] = None,
+        residual: jax.Array | None = None,
+    ) -> Tuple[jax.Array, jax.Array, Optional[jax.Array], list]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states += residual
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, new_cache = self.self_attn(
-            hidden_states, positions, attention_mask, cache
+        hidden_states, kv_fused = self.self_attn(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
         )
 
-        hidden_states = residual + hidden_states
+        hidden_states += residual
         residual = hidden_states
-
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
-        return hidden_states, new_cache
+        return hidden_states, residual, kv_fused, []
 
 
 class MiMoAudioTransformer(nnx.Module):
@@ -361,11 +284,12 @@ class MiMoAudioTransformer(nnx.Module):
                 rope_theta=rope_theta,
                 rms_norm_eps=rms_norm_eps,
                 mesh=mesh,
+                layer_id=i,
                 use_bias=use_bias,
                 use_causal_mask=use_causal_mask,
                 dtype=dtype,
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ])
 
         self.norm = RMSNorm(
@@ -378,64 +302,49 @@ class MiMoAudioTransformer(nnx.Module):
         self,
         input_ids_or_embeds: jax.Array,
         positions: jax.Array,
-        attention_mask: Optional[jax.Array] = None,
-        cache: Optional[list] = None,
-    ) -> Tuple[jax.Array, Optional[list]]:
+        forward_batch: Optional[ForwardBatch] = None,
+        token_to_kv_pool: Optional[KVCache] = None,
+    ) -> Tuple[jax.Array, list, list]:
         """
         Args:
-            input_ids_or_embeds: Token IDs [B, T] if has_embedder else embeddings [B, T, hidden_size]
-            positions: Position IDs [B, T] or [T]
-            attention_mask: Optional attention mask
-            cache: Optional list of layer caches
+            input_ids_or_embeds: Embeddings [Total_Tokens, hidden_size] or [B, T, H]
+            positions: Position IDs
+            forward_batch: ForwardBatch info (Optional)
+            token_to_kv_pool: KVCache pool (Optional)
 
         Returns:
-            hidden_states: [B, T, hidden_size]
-            new_cache: Updated cache list
+            hidden_states: Output embeddings
+            layers_kv_fused: List of KV outputs (None for standard attention)
+            layers_callback_flag: Callback flags
         """
-        if self.has_embedder and input_ids_or_embeds.ndim == 2 and jnp.issubdtype(input_ids_or_embeds.dtype, jnp.integer):
+        if self.has_embedder and jnp.issubdtype(input_ids_or_embeds.dtype, jnp.integer):
+            # Rank 2 [B, T] or Rank 1 [Total]
             hidden_states = self.embed_tokens(input_ids_or_embeds)
         else:
             hidden_states = input_ids_or_embeds
 
-        new_cache = [] if cache is not None else None
+        residual = None
+        layers_kv_fused = []
+        layers_callback_flag = []
 
-        for i, layer in enumerate(self.layers):
-            layer_cache = cache[i] if cache is not None else None
-            hidden_states, layer_new_cache = layer(
-                hidden_states, positions, attention_mask, layer_cache
-            )
-            if new_cache is not None:
-                new_cache.append(layer_new_cache)
-
-        hidden_states = self.norm(hidden_states)
-        return hidden_states, new_cache
-
-    def init_cache(
-        self,
-        batch_size: int,
-        max_seq_len: int,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ) -> list:
-        """Initialize fixed-size KV cache for all layers.
-
-        Args:
-            batch_size: Batch size
-            max_seq_len: Maximum sequence length (pre-allocated size)
-            dtype: Data type for cache
-
-        Returns:
-            List of (k_cache, v_cache, cache_pos) tuples for each layer
-        """
-        cache = []
         for layer in self.layers:
-            num_kv_heads = layer.self_attn.num_kv_heads
-            head_dim = layer.self_attn.head_dim
-            # Pre-allocate fixed-size cache
-            k_cache = jnp.zeros((batch_size, max_seq_len, num_kv_heads, head_dim), dtype=dtype)
-            v_cache = jnp.zeros((batch_size, max_seq_len, num_kv_heads, head_dim), dtype=dtype)
-            cache_pos = 0  # Current write position
-            cache.append((k_cache, v_cache, cache_pos))
-        return cache
+            hidden_states, residual, kv_fused, callback_flag = layer(
+                hidden_states,
+                positions,
+                forward_batch,
+                token_to_kv_pool,
+                residual,
+            )
+            layers_kv_fused.append(kv_fused)
+            layers_callback_flag.extend(callback_flag)
+
+
+        if residual is not None:
+            hidden_states += residual
+        hidden_states = self.norm(hidden_states)
+
+
+        return hidden_states, layers_kv_fused, layers_callback_flag
 
 
 class MiMoAudioForCausalLM(nnx.Module):
@@ -511,12 +420,12 @@ class MiMoAudioForCausalLM(nnx.Module):
         )
 
         # LM head for text
-        self.lm_head = LinearBase(
-            input_size=config.hidden_size,
-            output_size=config.vocab_size,
-            use_bias=False,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_axes=("tensor", None),
             mesh=mesh,
         )
 
@@ -567,6 +476,8 @@ class MiMoAudioForCausalLM(nnx.Module):
             mesh=mesh,
         )
 
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+
     def load_weights(self, model_config: ModelConfig):
         """Load weights from safetensors file."""
         loader = WeightLoader(
@@ -600,7 +511,7 @@ class MiMoAudioForCausalLM(nnx.Module):
         positions = jnp.arange(group_size)
 
         # Process through patch encoder
-        output, _ = self.patch_encoder(input_embeddings, positions)
+        output, _, _ = self.patch_encoder(input_embeddings, positions)
 
         # Reshape back: [B, T_groups, group_size, hidden_size]
         return output.reshape(B, T_groups, group_size, hidden_size)
@@ -675,45 +586,90 @@ class MiMoAudioForCausalLM(nnx.Module):
         # Combine text and speech embeddings
         return text_embeds + speech_grouped_embeds
 
-    def forward(
+    def forward_simple(
         self,
         input_ids: jax.Array,
-        cache: Optional[list] = None,
-    ) -> Tuple[jax.Array, jax.Array, Optional[list]]:
-        """Forward pass through main transformer.
+        positions: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Simplified forward pass using standard attention (no KV cache).
+
+        This method is used when RadixAttention/KV cache pool is not available,
+        such as in multi-stage pipelines where mesh context is managed externally.
 
         Args:
             input_ids: [B, 1 + audio_channels, seq_len]
-            cache: Optional KV cache
+            positions: Position IDs [T_groups]
 
         Returns:
-            text_logits: [B, 1, vocab_size]
+            text_logits: [B, T_groups, vocab_size]
             local_hidden_states: [B, 1, local_dim]
-            cache: Updated cache
         """
-        text_input_ids = input_ids[:, 0, :: self.config.group_size]
-        B, T_groups = text_input_ids.shape
-
-        # Prepare input embeddings
+        # Prepare input embeddings (MiMo specific)
         inputs_embeds = self._prepare_input_embeds(input_ids)
 
-        # Create position IDs
-        positions = jnp.arange(T_groups)
+        B, T_groups, H = inputs_embeds.shape
 
-        # Forward through main transformer
-        hidden_states, cache = self.model(
-            inputs_embeds, positions, attention_mask=None, cache=cache
-        )
+        # Forward through main transformer using Branch 2 (no KV cache)
+        # Passing None for forward_batch and token_to_kv_pool triggers simple attention
+        hidden_states, _, _ = self.model(inputs_embeds, positions, None, None)
 
-        # Get text logits from last position
-        text_logits, _ = self.lm_head(hidden_states[:, -1:, :])  # [B, 1, vocab_size]
+        # Get text logits using ParallelLMHead's embedding matrix
+        hidden_states_promoted, embedding = self.lm_head.promote_dtype(hidden_states)
+        text_logits = jnp.matmul(hidden_states_promoted, embedding.T)  # [B, T_groups, vocab_size]
 
         # Downcast hidden states for local transformer
         local_hidden_states, _ = self.hidden_states_downcast(
             hidden_states[:, -1:, :]
         )  # [B, 1, local_dim]
 
-        return text_logits, local_hidden_states, cache
+        return text_logits, local_hidden_states
+
+    def forward(
+        self,
+        input_ids: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        logits_metadata: LogitsMetadata,
+    ) -> Tuple[jax.Array, jax.Array, None, list, list]:
+        """Forward pass through main transformer.
+
+        Args:
+            input_ids: [B, 1 + audio_channels, seq_len]
+            forward_batch: Batch metadata
+            token_to_kv_pool: KV Cache pool
+            logits_metadata: Metadata for logits processing
+
+        Returns:
+            text_logits: LogitsProcessorOutput
+            local_hidden_states: [B, 1, local_dim]
+            cache: None (Managed by RadixAttention)
+            layers_kv_fused: KV outputs
+            layers_callback_flag: Callback flags
+        """
+        # Prepare input embeddings (MiMo specific)
+        inputs_embeds = self._prepare_input_embeds(input_ids)
+        
+        # Flatten embeddings for RadixAttention: [Total_Tokens, H]
+        B, T_groups, H = inputs_embeds.shape
+        inputs_embeds_flat = inputs_embeds.reshape(-1, H)
+
+        # Forward through main transformer
+        hidden_states, layers_kv_fused, layers_callback_flag = self.model(
+            inputs_embeds_flat, forward_batch.positions, forward_batch, token_to_kv_pool
+        )
+        
+        # Get logits for the last positions using LogitsProcessor
+        text_logits = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+
+        # Reshape hidden_states back to [B, T_groups, H] to get local_hidden_states
+        hidden_states = hidden_states.reshape(B, T_groups, H)
+        
+        # Downcast hidden states for local transformer
+        local_hidden_states, _ = self.hidden_states_downcast(
+            hidden_states[:, -1:, :]
+        )  # [B, 1, local_dim]
+
+        return text_logits, local_hidden_states, None, layers_kv_fused, layers_callback_flag
 
     def patch_decode(
         self,
@@ -746,8 +702,8 @@ class MiMoAudioForCausalLM(nnx.Module):
         for t in range(delay_iters):
             positions = jnp.array([t])
 
-            # Forward through patch decoder without cache for now (simpler, avoids sharding issues)
-            hidden_state, _ = self.patch_decoder(local_embeds, positions, cache=None)
+            # Forward through patch decoder without cache (simpler, avoids sharding issues)
+            hidden_state, _, _ = self.patch_decoder(local_embeds, positions)
 
             next_local_embeds = jnp.zeros_like(local_embeds)
 
