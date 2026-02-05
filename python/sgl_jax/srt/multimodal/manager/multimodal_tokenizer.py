@@ -847,7 +847,21 @@ class MultimodalTokenizer(TokenizerManager):
         # Tokenize the prompt (instruction)
         text_input_ids = None
         if obj.prompt and self.tokenizer is not None:
-            encoded = self.tokenizer(obj.prompt)
+            prompt_text = obj.prompt
+            # Try to apply chat template to guide the model
+            try:
+                if hasattr(self.tokenizer, "apply_chat_template"):
+                    messages = [{"role": "user", "content": prompt_text}]
+                    formatted_prompt = self.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    if formatted_prompt:
+                        prompt_text = formatted_prompt
+                        logger.info("ASR used chat template: %r", prompt_text)
+            except Exception as e:
+                logger.warning("Failed to apply chat template for ASR: %s", e)
+
+            encoded = self.tokenizer(prompt_text)
             text_input_ids = encoded["input_ids"]
 
         from sgl_jax.srt.multimodal.manager.schedule_batch import Req
