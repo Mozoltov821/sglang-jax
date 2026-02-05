@@ -849,6 +849,7 @@ class MultimodalTokenizer(TokenizerManager):
         if obj.prompt and self.tokenizer is not None:
             prompt_text = obj.prompt
             # Try to apply chat template to guide the model
+            applied_template = False
             try:
                 if hasattr(self.tokenizer, "apply_chat_template"):
                     messages = [{"role": "user", "content": prompt_text}]
@@ -857,9 +858,16 @@ class MultimodalTokenizer(TokenizerManager):
                     )
                     if formatted_prompt:
                         prompt_text = formatted_prompt
+                        applied_template = True
                         logger.info("ASR used chat template: %r", prompt_text)
             except Exception as e:
                 logger.warning("Failed to apply chat template for ASR: %s", e)
+            
+            # Fallback to manual ChatML construction if template failed
+            if not applied_template:
+                # Construct Qwen-style ChatML format manually
+                prompt_text = f"<|im_start|>user\n{obj.prompt}<|im_end|>\n<|im_start|>assistant\n"
+                logger.info("ASR used manual ChatML format: %r", prompt_text)
 
             encoded = self.tokenizer(prompt_text)
             text_input_ids = encoded["input_ids"]
