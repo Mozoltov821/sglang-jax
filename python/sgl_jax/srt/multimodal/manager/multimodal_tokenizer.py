@@ -844,26 +844,23 @@ class MultimodalTokenizer(TokenizerManager):
                                 except Exception as e:
                                     logger.warning("Failed to download audio from URL: %s", e)
 
-        # 2. Apply chat template to prompt
+        # 2. Construct Prompt Segments (Manual construction for precise Audio placement)
+        # Official format: <|im_start|>user\n [AUDIO] {prompt} <|im_end|>\n<|im_start|>assistant\n
+        
+        prefix_text = "<|im_start|>user\n"
+        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n"
+        
+        prefix_ids = []
+        suffix_ids = []
+        
         if self.tokenizer:
             try:
-                # Use standard chat template logic
-                messages = [{"role": "user", "content": prompt_text.strip()}]
-                if hasattr(self.tokenizer, "apply_chat_template"):
-                    formatted_prompt = self.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
-                    if formatted_prompt:
-                        prompt_text = formatted_prompt
-                else:
-                    # Manual fallback
-                    prompt_text = f"<|im_start|>user\n{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n"
+                # Tokenize prefix
+                prefix_ids = self.tokenizer(prefix_text)["input_ids"]
+                # Tokenize suffix
+                suffix_ids = self.tokenizer(suffix_text)["input_ids"]
             except Exception as e:
-                logger.warning("Chat template error in chat_completion_audio: %s", e)
-            
-            tokenized_ids = self.tokenizer(prompt_text)["input_ids"]
-        else:
-            tokenized_ids = []
+                logger.warning("Tokenization error in chat_completion_audio: %s", e)
 
         # 3. Process audio if present
         mel_input = None
@@ -882,7 +879,8 @@ class MultimodalTokenizer(TokenizerManager):
             mel_input=mel_input,
             mel_input_lens=mel_input_lens,
             audio_mode="audio_understanding",
-            text_input_ids=tokenized_ids,
+            text_input_ids=suffix_ids,
+            prompt_input_ids=prefix_ids,
             data_type=DataType.AUDIO,
             sample_rate=24000,
             prompt=prompt_text,

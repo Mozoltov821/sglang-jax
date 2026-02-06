@@ -324,21 +324,24 @@ class Req:
                 segments.append(self._build_text_segment(self.text_input_ids))
 
         elif self.audio_mode == "audio_understanding":
-            # Audio understanding: audio patches + question text
+            # Audio understanding: [prefix] + audio patches + question text
+            if self.prompt_input_ids:
+                segments.append(self._build_text_segment(self.prompt_input_ids))
+                
             if self.audio_codes is not None:
-                segments.append(self._build_sosp_segment())
                 segments.append(self._build_audio_segment(self.audio_codes))
-                segments.append(self._build_eosp_segment())
+
             if self.text_input_ids:
                 segments.append(self._build_text_segment(self.text_input_ids))
 
         elif self.audio_mode == "asr":
-            # ASR (Automatic Speech Recognition): audio patches + instruction text
-            # The instruction (e.g., "请转录这段音频") guides the model to transcribe
+            # ASR: [prefix] + audio patches + instruction text
+            if self.prompt_input_ids:
+                segments.append(self._build_text_segment(self.prompt_input_ids))
+
             if self.audio_codes is not None:
-                segments.append(self._build_sosp_segment())
                 segments.append(self._build_audio_segment(self.audio_codes))
-                segments.append(self._build_eosp_segment())
+
             if self.text_input_ids:
                 segments.append(self._build_text_segment(self.text_input_ids))
 
