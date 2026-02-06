@@ -120,7 +120,7 @@ class AudioBackboneScheduler:
             # Get sampler config from request or use defaults
             sampler_config = self._get_sampler_config(req)
 
-            if req.audio_mode == "asr":
+            if req.audio_mode in ("asr", "audio_understanding"):
                 self._generate_asr_text(req, sampler_config)
             else:
                 # Forward through main transformer
