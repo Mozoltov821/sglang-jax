@@ -138,26 +138,28 @@ class Stage:
             else:
                 stage_server_args = self.server_args
 
-            self._stage_scheduler = scheduler_class(
-                communication_backend=comm_backend,
-                mesh=self.mesh,
-                server_args=stage_server_args,
-                model_class=model_class,
-                **self.stage_config.scheduler_params,
-            )
-            self._out_queue.put_nowait({"status": "ready"})
-            logger.info(
-                "Stage-%d initialized successfully, Scheduler:%s",
-                self.stage_id,
-                self.stage_config.scheduler,
-            )
-            if getattr(self._stage_scheduler, "enable_overlap", False):
-                raise AssertionError(
-                    "currently we not support overlap for autoregressive scheduler"
+            # Set mesh context for all JAX operations in this stage
+            with self.mesh:
+                self._stage_scheduler = scheduler_class(
+                    communication_backend=comm_backend,
+                    mesh=self.mesh,
+                    server_args=stage_server_args,
+                    model_class=model_class,
+                    **self.stage_config.scheduler_params,
                 )
-                # self._stage_scheduler.event_loop_overlap()
-            else:
-                self._stage_scheduler.event_loop_normal()
+                self._out_queue.put_nowait({"status": "ready"})
+                logger.info(
+                    "Stage-%d initialized successfully, Scheduler:%s",
+                    self.stage_id,
+                    self.stage_config.scheduler,
+                )
+                if getattr(self._stage_scheduler, "enable_overlap", False):
+                    raise AssertionError(
+                        "currently we not support overlap for autoregressive scheduler"
+                    )
+                    # self._stage_scheduler.event_loop_overlap()
+                else:
+                    self._stage_scheduler.event_loop_normal()
         except Exception:
             traceback = get_exception_traceback()
             logger.error("Stage-%d hit exception: %s", self.stage_id, traceback)
