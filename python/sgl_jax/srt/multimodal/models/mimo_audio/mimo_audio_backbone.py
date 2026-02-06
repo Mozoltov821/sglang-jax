@@ -150,24 +150,70 @@ class MiMoAudioAttention(nnx.Module):
         self,
         hidden_states: jax.Array,
         positions: jax.Array,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-    ) -> Tuple[jax.Array, jax.Array]:
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        forward_batch: Optional[ForwardBatch] = None,
+        token_to_kv_pool: Optional[KVCache] = None,
+    ) -> Tuple[jax.Array, Optional[jax.Array]]:
+        
+        # Branch 1: RadixAttention (Cached / Main Model)
+        if token_to_kv_pool is not None:
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
 
-        # Reshape to [Total_Tokens, num_heads, head_dim]
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+            # Reshape to [Total_Tokens, num_heads, head_dim]
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
-        q, k = self.rotary_emb(positions, q, k)
+            # Apply rotary embeddings
+            q, k = self.rotary_emb(positions, q, k)
 
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+            attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+            output, _ = self.o_proj(attn_output)
+            return output, kv_fused
 
-        output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+        # Branch 2: Standard Attention (Stateless / Patch Encoder)
+        else:
+            batch_size, seq_len, _ = hidden_states.shape
+            
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
+
+            q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+            k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+            v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
+            # RoPE
+            # positions can be [Seq] or [Batch, Seq]
+            positions_flat = positions.reshape(-1) if positions.ndim > 1 else jnp.tile(positions, batch_size)
+            q_flat = q.reshape(-1, self.num_heads, self.head_dim)
+            k_flat = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            q_rot, k_rot = self.rotary_emb(positions_flat, q_flat, k_flat)
+            q = q_rot.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+            k = k_rot.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
+            # Attention
+            if self.num_kv_heads < self.num_heads:
+                k = jnp.repeat(k, self.num_heads // self.num_kv_heads, axis=2)
+                v = jnp.repeat(v, self.num_heads // self.num_kv_heads, axis=2)
+            
+            q = q.transpose(0, 2, 1, 3) # [B, H, T, D]
+            k = k.transpose(0, 2, 1, 3)
+            v = v.transpose(0, 2, 1, 3)
+
+            attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scaling
+            
+            if self.use_causal_mask:
+                causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+                attn_weights = jnp.where(causal_mask[None, None, :, :], attn_weights, -jnp.inf)
+            
+            attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(v.dtype)
+            attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v)
+            attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+            
+            output, _ = self.o_proj(attn_output)
+            return output, None
 
 
 class MiMoAudioDecoderLayer(nnx.Module):
@@ -223,10 +269,10 @@ class MiMoAudioDecoderLayer(nnx.Module):
         self,
         hidden_states: jax.Array,
         positions: jax.Array,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        forward_batch: Optional[ForwardBatch] = None,
+        token_to_kv_pool: Optional[KVCache] = None,
         residual: jax.Array | None = None,
-    ) -> Tuple[jax.Array, jax.Array, jax.Array, list]:
+    ) -> Tuple[jax.Array, jax.Array, Optional[jax.Array], list]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
