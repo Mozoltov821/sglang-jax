@@ -358,21 +358,24 @@ class MiMoAudioTransformer(nnx.Module):
     def __call__(
         self,
         input_ids_or_embeds: jax.Array,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        positions: jax.Array,
+        forward_batch: Optional[ForwardBatch] = None,
+        token_to_kv_pool: Optional[KVCache] = None,
     ) -> Tuple[jax.Array, list, list]:
         """
         Args:
-            input_ids_or_embeds: Token IDs [B, T] if has_embedder else embeddings [B, T, hidden_size]
-            forward_batch: ForwardBatch info
-            token_to_kv_pool: KVCache pool
+            input_ids_or_embeds: Embeddings [Total_Tokens, hidden_size] or [B, T, H]
+            positions: Position IDs
+            forward_batch: ForwardBatch info (Optional)
+            token_to_kv_pool: KVCache pool (Optional)
 
         Returns:
-            hidden_states: [B, T, hidden_size]
-            layers_kv_fused: List of KV outputs
+            hidden_states: Output embeddings
+            layers_kv_fused: List of KV outputs (None for standard attention)
             layers_callback_flag: Callback flags
         """
-        if self.has_embedder and input_ids_or_embeds.ndim == 2 and jnp.issubdtype(input_ids_or_embeds.dtype, jnp.integer):
+        if self.has_embedder and jnp.issubdtype(input_ids_or_embeds.dtype, jnp.integer):
+            # Rank 2 [B, T] or Rank 1 [Total]
             hidden_states = self.embed_tokens(input_ids_or_embeds)
         else:
             hidden_states = input_ids_or_embeds
@@ -384,7 +387,7 @@ class MiMoAudioTransformer(nnx.Module):
         for layer in self.layers:
             hidden_states, residual, kv_fused, callback_flag = layer(
                 hidden_states,
-                forward_batch.positions,
+                positions,
                 forward_batch,
                 token_to_kv_pool,
                 residual,
