@@ -9,6 +9,6 @@ setup: |
   chmod 600 ~/.ssh/id_rsa
   rm ~/.ssh/config
   GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" git clone git@github.com:Mozoltov821/sglang-jax.git 
-  cd sgl-jax 
+  cd sglang-jax 
   uv venv --python 3.12 && source .venv/bin/activate
   uv pip install -e "python[all]"
