@@ -159,21 +159,37 @@ class AudioBackboneScheduler:
         """Autoregressive text generation for ASR mode."""
         max_new_tokens = getattr(req, "max_new_tokens", 256)
         generated_ids = []
+        
+        # RadixAttention manages cache internally
         cache = None
+        
         current_input_ids = req.input_ids
+        current_pos = 0
 
         # We need sharding spec for creating new input arrays
-        sharding = NamedSharding(self.mesh, PartitionSpec())
+        # Input IDs: [Batch, Channels, Seq] -> (None, None, None) Replicated
+        input_sharding = NamedSharding(self.mesh, PartitionSpec(None, None, None))
+        # Positions: [Seq] -> Replicated (None)
+        pos_sharding = NamedSharding(self.mesh, PartitionSpec())
 
         for step in range(max_new_tokens):
             # Temporarily update request input_ids and cache for forward pass
             req.input_ids = current_input_ids
             
+            # Calculate positions explicitly to avoid JIT concretization errors
+            # T_groups = seq_len // group_size
+            T_groups = current_input_ids.shape[-1] // MIMO_AUDIO_GROUP_SIZE
+            positions_np = np.arange(current_pos, current_pos + T_groups, dtype=np.int32)
+            positions = device_array(positions_np, sharding=pos_sharding)
+
             # Forward pass
             (text_logits, local_hidden_states, new_cache), _ = self.backbone_worker.forward(
-                req, cache=cache
+                req, cache=cache, positions=positions
             )
             cache = new_cache
+            
+            # Update position
+            current_pos += T_groups
 
             # Move to CPU for sampling to avoid ShardingTypeError and allow easy masking
             logits_np = np.array(jax.device_get(text_logits))
@@ -216,7 +232,7 @@ class AudioBackboneScheduler:
 
             # Prepare input for next step
             current_input_ids = self._build_next_step_input(next_token_scalar, audio_tokens)
-            current_input_ids = device_array(current_input_ids, sharding=sharding)
+            current_input_ids = device_array(current_input_ids, sharding=input_sharding)
         
         # Use numpy array to avoid JAX initialization in detokenizer process
         req.generated_text_tokens = np.array(generated_ids, dtype=np.int32)

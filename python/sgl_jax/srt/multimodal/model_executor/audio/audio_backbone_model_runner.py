@@ -1,6 +1,7 @@
 """Audio Backbone Model Runner for MiMo Audio."""
 
 import json
+import logging
 import os
 from functools import partial
 from typing import Optional
@@ -8,10 +9,13 @@ from typing import Optional
 import huggingface_hub
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
@@ -21,7 +25,7 @@ from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
 from sgl_jax.srt.multimodal.configs.config_registry import get_audio_backbone_config
 from sgl_jax.srt.server_args import ServerArgs
 
-
+logger = logging.getLogger(__name__)
 class AudioBackboneModelRunner(BaseModelRunner):
     """Model runner for MiMo Audio Backbone (LLM with audio generation)."""
 
@@ -45,7 +49,25 @@ class AudioBackboneModelRunner(BaseModelRunner):
 
     def initialize(self):
         self.load_model()
+        self.init_memory_pool()
         self.initialize_jit()
+
+    def init_memory_pool(self):
+        """Initialize memory pool for KV cache."""
+        # Simple fixed size pool for now
+        self.max_total_num_tokens = 32768
+        self.page_size = 1 # Simple indexing
+        
+        self.token_to_kv_pool = MHATokenToKVPool(
+            size=self.max_total_num_tokens,
+            page_size=self.page_size,
+            dtype=jnp.bfloat16,
+            head_num=self.model_config.num_key_value_heads, # Assume TP=1 for now
+            head_dim=self.model_config.head_dim,
+            layer_num=self.model_config.num_hidden_layers,
+            mesh=self.mesh,
+        )
+        logger.info("Initialized KV Memory Pool with size %d", self.max_total_num_tokens)
 
     def _load_hf_config(self, model_path: str) -> dict:
         """Load config.json from HuggingFace model path."""
@@ -107,6 +129,7 @@ class AudioBackboneModelRunner(BaseModelRunner):
 
         @partial(
             jax.jit,
+            donate_argnames=["token_to_kv_pool"],
             static_argnames=["model_state_def"],
         )
         def forward(
@@ -114,11 +137,12 @@ class AudioBackboneModelRunner(BaseModelRunner):
             model_state_def,
             model_state_leaves,
             input_ids,
-            cache,
+            forward_batch,
+            token_to_kv_pool,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model.forward(input_ids, cache)
+            return model.forward(input_ids, forward_batch, token_to_kv_pool)
 
         @partial(
             jax.jit,
@@ -140,9 +164,16 @@ class AudioBackboneModelRunner(BaseModelRunner):
 
         def forward_wrapper(
             input_ids: jax.Array,
-            cache: Optional[list] = None,
+            forward_batch: ForwardBatch,
         ):
-            return forward(model_def, model_state_def, model_state_leaves, input_ids, cache)
+            return forward(
+                model_def, 
+                model_state_def, 
+                model_state_leaves, 
+                input_ids, 
+                forward_batch, 
+                self.token_to_kv_pool
+            )
 
         def patch_decode_wrapper(
             local_embeds: jax.Array,
@@ -170,20 +201,59 @@ class AudioBackboneModelRunner(BaseModelRunner):
         cache: Optional[list] = None,
         **kwargs,
     ):
-        """Forward pass through main transformer.
+        """Forward pass through main transformer using RadixAttention.
 
         Args:
             input_ids: [B, 1 + audio_channels, seq_len]
-            cache: Optional KV cache
+            cache: Unused (legacy)
+            kwargs: Must contain 'positions'
 
         Returns:
-            (text_logits, local_hidden_states, cache), cache_miss_count
+            (text_logits, local_hidden_states, None), cache_miss_count
         """
         cache_miss_count = 0
+        positions = kwargs.get("positions", None)
+        
+        # Infer positions if not provided (Prefill)
+        if positions is None:
+            B, _, L = input_ids.shape
+            positions = jnp.arange(L, dtype=jnp.int32)
+            # Add batch dim if needed? Positions usually [T] or [B, T].
+            # For RadixAttention, it expects flattened [Total_Tokens].
+            # Since B=1, [T] is fine.
+        
+        # Determine Forward Mode
+        # If starting from 0, it's EXTEND/PREFILL
+        is_prefill = (positions[0] == 0)
+        forward_mode = ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE
+        
+        # Simple Request Pool Indexing: Identity map position -> pool index
+        # This assumes single request running linearly filling the cache
+        req_pool_indices = positions
+        
+        # Seq Lens: [B]
+        # Current length is last position + 1
+        seq_lens = jnp.array([positions[-1] + 1], dtype=jnp.int32)
+        
+        # Construct ForwardBatch
+        # Note: RadixAttention expects flattened arrays
+        forward_batch = ForwardBatch(
+            input_ids=None, # We pass custom input_ids separately
+            positions=positions,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=forward_mode,
+            # Add other required fields with defaults
+            out_cache_indices=None,
+            return_logprob=False,
+            top_logprobs_num=0,
+            token_to_kv_pool=self.token_to_kv_pool, # Optional reference
+        )
+
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output = self.jitted_forward(input_ids, cache)
+            output = self.jitted_forward(input_ids, forward_batch)
             cache_miss_count = count()
         return output, cache_miss_count
 

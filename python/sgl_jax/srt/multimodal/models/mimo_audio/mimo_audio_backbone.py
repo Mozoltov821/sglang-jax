@@ -5,11 +5,16 @@ from typing import Optional, Tuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
     MiMoAudioBackboneConfig,
@@ -66,15 +71,7 @@ class MiMoAudioMLP(nnx.Module):
 
 
 class MiMoAudioAttention(nnx.Module):
-    """Standard attention layer for MiMo Audio model.
-
-    Unlike RadixAttention used in LLM serving, this uses standard attention
-    since audio token generation doesn't require KV cache sharing.
-
-    Supports two cache modes:
-    - Fixed-size cache with position index (for patch_decoder with fixed steps)
-    - Dynamic concatenation cache (for main transformer)
-    """
+    """Standard attention layer for MiMo Audio model using RadixAttention."""
 
     def __init__(
         self,
@@ -85,6 +82,7 @@ class MiMoAudioAttention(nnx.Module):
         max_position_embeddings: int,
         rope_theta: float,
         mesh: jax.sharding.Mesh,
+        layer_id: int = 0,
         use_bias: bool = True,
         use_causal_mask: bool = True,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -95,6 +93,7 @@ class MiMoAudioAttention(nnx.Module):
         self.head_dim = head_dim
         self.use_causal_mask = use_causal_mask
         self.scaling = head_dim**-0.5
+        self.layer_id = layer_id
 
         self.q_proj = LinearBase(
             input_size=hidden_size,
@@ -138,111 +137,36 @@ class MiMoAudioAttention(nnx.Module):
             dtype=dtype,
         )
 
+        self.attn = RadixAttention(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scaling=self.scaling,
+            num_kv_heads=num_kv_heads,
+            layer_id=layer_id,
+        )
+
     def __call__(
         self,
         hidden_states: jax.Array,
         positions: jax.Array,
-        attention_mask: Optional[jax.Array] = None,
-        cache: Optional[Tuple[jax.Array, jax.Array, int]] = None,
-    ) -> Tuple[jax.Array, Optional[Tuple[jax.Array, jax.Array, int]]]:
-        """
-        Args:
-            hidden_states: [B, T, hidden_size]
-            positions: [B, T] or [T]
-            attention_mask: Optional attention mask
-            cache: Optional (key_cache, value_cache, cache_pos) for fixed-size cache
-                   where cache_pos is the current write position
-
-        Returns:
-            output: [B, T, hidden_size]
-            new_cache: Updated cache tuple (k, v, new_pos)
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> Tuple[jax.Array, jax.Array]:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        # Reshape to [B, T, num_heads, head_dim]
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        # Reshape to [Total_Tokens, num_heads, head_dim]
+        q = q.reshape(-1, self.num_heads, self.head_dim)
+        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
-        # Apply rotary embeddings
-        q_flat = q.reshape(-1, self.num_heads, self.head_dim)
-        k_flat = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        positions_flat = positions.reshape(-1) if positions.ndim > 1 else jnp.tile(positions, batch_size)
+        q, k = self.rotary_emb(positions, q, k)
 
-        q_flat, k_flat = self.rotary_emb(positions_flat, q_flat, k_flat)
-
-        q = q_flat.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k_flat.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-
-        # Handle KV cache
-        if cache is not None:
-            cached_k, cached_v, cache_pos = cache
-            # Force k/v to be replicated to match cache sharding
-            k = jnp.asarray(k)
-            v = jnp.asarray(v)
-            # Update cache at current position using fixed-size indexing
-            cached_k = jax.lax.dynamic_update_slice(
-                cached_k, k, (0, cache_pos, 0, 0)
-            )
-            cached_v = jax.lax.dynamic_update_slice(
-                cached_v, v, (0, cache_pos, 0, 0)
-            )
-            new_cache_pos = cache_pos + seq_len
-            # Use all cached KV up to current position for attention
-            kv_len = new_cache_pos
-            k_for_attn = jax.lax.dynamic_slice(
-                cached_k, (0, 0, 0, 0), (batch_size, kv_len, self.num_kv_heads, self.head_dim)
-            )
-            v_for_attn = jax.lax.dynamic_slice(
-                cached_v, (0, 0, 0, 0), (batch_size, kv_len, self.num_kv_heads, self.head_dim)
-            )
-            new_cache = (cached_k, cached_v, new_cache_pos)
-        else:
-            k_for_attn = k
-            v_for_attn = v
-            kv_len = seq_len
-            new_cache = None
-
-        # Repeat KV heads if needed (GQA)
-        if self.num_kv_heads < self.num_heads:
-            repeat_factor = self.num_heads // self.num_kv_heads
-            k_for_attn = jnp.repeat(k_for_attn, repeat_factor, axis=2)
-            v_for_attn = jnp.repeat(v_for_attn, repeat_factor, axis=2)
-
-        # Compute attention: [B, num_heads, T_q, T_kv]
-        q = q.transpose(0, 2, 1, 3)  # [B, num_heads, T, head_dim]
-        k_for_attn = k_for_attn.transpose(0, 2, 1, 3)
-        v_for_attn = v_for_attn.transpose(0, 2, 1, 3)
-
-        attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k_for_attn) * self.scaling
-
-        # Apply causal mask if needed
-        if self.use_causal_mask:
-            # For cached attention, we need to mask based on absolute positions
-            if cache is not None:
-                # Query attends to all positions up to and including its own
-                causal_mask = jnp.tril(jnp.ones((seq_len, kv_len), dtype=jnp.bool_), k=kv_len - seq_len)
-            else:
-                causal_mask = jnp.tril(jnp.ones((seq_len, kv_len), dtype=jnp.bool_))
-            attn_weights = jnp.where(causal_mask[None, None, :, :], attn_weights, -jnp.inf)
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(v_for_attn.dtype)
-
-        # Apply attention to values
-        attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v_for_attn)
-
-        # Reshape back: [B, T, num_heads * head_dim]
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
         output, _ = self.o_proj(attn_output)
-        return output, new_cache
+        return output, kv_fused
 
 
 class MiMoAudioDecoderLayer(nnx.Module):
