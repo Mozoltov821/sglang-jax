@@ -1,4 +1,5 @@
 """MiMo Audio Backbone model implementation for sglang-jax."""
+# Forced sync update
 
 from typing import Optional, Tuple
 
@@ -183,6 +184,7 @@ class MiMoAudioDecoderLayer(nnx.Module):
         rope_theta: float,
         rms_norm_eps: float,
         mesh: jax.sharding.Mesh,
+        layer_id: int = 0,
         use_bias: bool = True,
         use_causal_mask: bool = True,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -195,6 +197,7 @@ class MiMoAudioDecoderLayer(nnx.Module):
             max_position_embeddings=max_position_embeddings,
             rope_theta=rope_theta,
             mesh=mesh,
+            layer_id=layer_id,
             use_bias=use_bias,
             use_causal_mask=use_causal_mask,
             dtype=dtype,
