@@ -99,6 +99,3 @@ class AudioBackboneModelWorker:
         """
         return self.model_runner.patch_decode(local_embeds, key, sampler_config)
 
-    def init_cache(self, batch_size: int) -> list:
-        """Initialize KV cache for main transformer."""
-        return self.model_runner.init_cache(batch_size)

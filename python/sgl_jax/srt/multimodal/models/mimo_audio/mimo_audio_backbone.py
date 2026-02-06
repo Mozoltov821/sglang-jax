@@ -642,6 +642,43 @@ class MiMoAudioForCausalLM(nnx.Module):
         # Combine text and speech embeddings
         return text_embeds + speech_grouped_embeds
 
+    def forward_simple(
+        self,
+        input_ids: jax.Array,
+        positions: jax.Array,
+    ) -> Tuple[jax.Array, jax.Array]:
+        """Simplified forward pass using standard attention (no KV cache).
+
+        This method is used when RadixAttention/KV cache pool is not available,
+        such as in multi-stage pipelines where mesh context is managed externally.
+
+        Args:
+            input_ids: [B, 1 + audio_channels, seq_len]
+            positions: Position IDs [T_groups]
+
+        Returns:
+            text_logits: [B, T_groups, vocab_size]
+            local_hidden_states: [B, 1, local_dim]
+        """
+        # Prepare input embeddings (MiMo specific)
+        inputs_embeds = self._prepare_input_embeds(input_ids)
+
+        B, T_groups, H = inputs_embeds.shape
+
+        # Forward through main transformer using Branch 2 (no KV cache)
+        # Passing None for forward_batch and token_to_kv_pool triggers simple attention
+        hidden_states, _, _ = self.model(inputs_embeds, positions, None, None)
+
+        # Get text logits for all positions
+        text_logits, _ = self.lm_head(hidden_states)  # [B, T_groups, vocab_size]
+
+        # Downcast hidden states for local transformer
+        local_hidden_states, _ = self.hidden_states_downcast(
+            hidden_states[:, -1:, :]
+        )  # [B, 1, local_dim]
+
+        return text_logits, local_hidden_states
+
     def forward(
         self,
         input_ids: jax.Array,

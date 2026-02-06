@@ -1,4 +1,8 @@
-"""Audio Backbone Model Runner for MiMo Audio."""
+"""Audio Backbone Model Runner for MiMo Audio.
+
+Simplified version without RadixAttention/KV cache pool to avoid mesh context issues.
+Uses standard attention (Branch 2 in MiMoAudioAttention) instead.
+"""
 
 import json
 import logging
@@ -13,11 +17,7 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
-from sgl_jax.srt.layers.attention.native_backend import NativeAttention
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
@@ -28,8 +28,14 @@ from sgl_jax.srt.multimodal.configs.config_registry import get_audio_backbone_co
 from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
 class AudioBackboneModelRunner(BaseModelRunner):
-    """Model runner for MiMo Audio Backbone (LLM with audio generation)."""
+    """Model runner for MiMo Audio Backbone (LLM with audio generation).
+
+    Uses simple attention without RadixAttention/KV cache pool to avoid
+    mesh context issues with shard_map operations.
+    """
 
     def __init__(
         self,
@@ -51,40 +57,7 @@ class AudioBackboneModelRunner(BaseModelRunner):
 
     def initialize(self):
         self.load_model()
-        self.page_size = 1  # Set before init_attention_backend which uses it
-        self.init_attention_backend()
-        self.init_memory_pool()
         self.initialize_jit()
-
-    def init_attention_backend(self):
-        """Init attention kernel backend."""
-        self.attn_backend = self._get_attention_backend()
-
-    def _get_attention_backend(self):
-        # Force NativeAttention for MiMo Audio backbone to avoid shard_map mesh context issues
-        # FlashAttention uses jax.shard_map which requires mesh context during JIT tracing
-        return NativeAttention(
-            self.model_config.num_attention_heads,
-            self.model_config.num_key_value_heads,
-            self.mesh,
-        )
-
-    def init_memory_pool(self):
-        """Initialize memory pool for KV cache."""
-        # Simple fixed size pool for now
-        self.max_total_num_tokens = 32768
-        self.page_size = 1 # Simple indexing
-        
-        self.token_to_kv_pool = MHATokenToKVPool(
-            size=self.max_total_num_tokens,
-            page_size=self.page_size,
-            dtype=jnp.bfloat16,
-            head_num=self.model_config.num_key_value_heads, # Assume TP=1 for now
-            head_dim=self.model_config.head_dim,
-            layer_num=self.model_config.num_hidden_layers,
-            mesh=self.mesh,
-        )
-        logger.info("Initialized KV Memory Pool with size %d", self.max_total_num_tokens)
 
     def _load_hf_config(self, model_path: str) -> dict:
         """Load config.json from HuggingFace model path."""
@@ -144,57 +117,50 @@ class AudioBackboneModelRunner(BaseModelRunner):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
-        # Define JIT functions within mesh context so shard_map can access mesh
-        with self.mesh:
-            @partial(
-                jax.jit,
-                donate_argnames=["token_to_kv_pool"],
-                static_argnames=["model_state_def"],
-            )
-            def forward(
-                model_def,
-                model_state_def,
-                model_state_leaves,
-                input_ids,
-                forward_batch,
-                token_to_kv_pool,
-                logits_metadata,
-            ):
-                model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-                model = nnx.merge(model_def, model_state)
-                return model.forward(input_ids, forward_batch, token_to_kv_pool, logits_metadata)
+        # Simple JIT without mesh context (no shard_map operations)
+        @partial(
+            jax.jit,
+            static_argnames=["model_state_def"],
+        )
+        def forward(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            input_ids,
+            positions,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model.forward_simple(input_ids, positions)
 
-            @partial(
-                jax.jit,
-                static_argnames=["model_state_def", "do_sample", "temperature"],
-            )
-            def patch_decode(
-                model_def,
-                model_state_def,
-                model_state_leaves,
-                local_embeds,
-                key,
-                do_sample,
-                temperature,
-            ):
-                model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-                model = nnx.merge(model_def, model_state)
-                sampler_config = MiMoSamplerConfig(do_sample=do_sample, temperature=temperature)
-                return model.patch_decode(local_embeds, key, sampler_config)
+        @partial(
+            jax.jit,
+            static_argnames=["model_state_def", "do_sample", "temperature"],
+        )
+        def patch_decode(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            local_embeds,
+            key,
+            do_sample,
+            temperature,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            sampler_config = MiMoSamplerConfig(do_sample=do_sample, temperature=temperature)
+            return model.patch_decode(local_embeds, key, sampler_config)
 
         def forward_wrapper(
             input_ids: jax.Array,
-            forward_batch: ForwardBatch,
-            logits_metadata: LogitsMetadata,
+            positions: jax.Array,
         ):
             return forward(
                 model_def,
                 model_state_def,
                 model_state_leaves,
                 input_ids,
-                forward_batch,
-                self.token_to_kv_pool,
-                logits_metadata
+                positions,
             )
 
         def patch_decode_wrapper(
@@ -223,7 +189,7 @@ class AudioBackboneModelRunner(BaseModelRunner):
         cache: Optional[list] = None,
         **kwargs,
     ):
-        """Forward pass through main transformer using RadixAttention.
+        """Forward pass through main transformer using simple attention.
 
         Args:
             input_ids: [B, 1 + audio_channels, seq_len]
@@ -235,62 +201,21 @@ class AudioBackboneModelRunner(BaseModelRunner):
         """
         cache_miss_count = 0
         positions = kwargs.get("positions", None)
-        
+
         # Infer positions if not provided (Prefill)
         if positions is None:
             B, _, L = input_ids.shape
-            positions = jnp.arange(L, dtype=jnp.int32)
-        
-        # Determine Forward Mode
-        is_prefill = (positions[0] == 0)
-        forward_mode = ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE
-        
-        # Simple Request Pool Indexing: Identity map position -> pool index
-        req_pool_indices = positions
-        out_cache_loc = positions
-        
-        # Seq Lens: [B]
-        seq_lens = jnp.array([positions[-1] + 1], dtype=jnp.int32)
-        
-        # Construct ForwardBatch
-        forward_batch = ForwardBatch(
-            bid=0, # Dummy bid
-            forward_mode=forward_mode,
-            batch_size=1,
-            input_ids=None,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            positions=positions,
-            extend_start_loc=jnp.array([0], dtype=jnp.int32) if is_prefill else None,
-            attn_backend=self.attn_backend,
-        )
-
-        if self.token_to_kv_pool is None:
-            raise ValueError("Token pool is None")
-
-        # Construct LogitsMetadata
-        logits_metadata = LogitsMetadata(
-            forward_mode=forward_mode,
-            # For MiMo, we only care about the last token's logits for ASR
-            # In decode mode, total_num_tokens is 1. In prefill, it is L.
-            # LogitsProcessor usually needs to know which positions to extract.
-            # Qwen2 style expects extract_last_only logic.
-        )
+            # For MiMo, L is seq_len, T_groups = L // group_size
+            T_groups = L // 4  # group_size = 4
+            positions = jnp.arange(T_groups, dtype=jnp.int32)
 
         import jax._src.test_util as jtu
 
-        with self.mesh:
-            with jtu.count_pjit_cpp_cache_miss() as count:
-                # output is (text_logits, local_hidden_states, None, layers_kv_fused, layers_callback_flag)
-                text_logits, local_hidden_states, _, layers_kv_fused, _ = self.jitted_forward(
-                    input_ids, forward_batch, logits_metadata
-                )
-                cache_miss_count = count()
+        with jtu.count_pjit_cpp_cache_miss() as count:
+            # output is (text_logits, local_hidden_states)
+            text_logits, local_hidden_states = self.jitted_forward(input_ids, positions)
+            cache_miss_count = count()
 
-            # Update KV Cache Buffer in Pool
-            self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
-        
         return (text_logits, local_hidden_states, None), cache_miss_count
 
     def patch_decode(
@@ -312,8 +237,7 @@ class AudioBackboneModelRunner(BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
-        with self.mesh:
-            with jtu.count_pjit_cpp_cache_miss() as count:
-                output = self.jitted_patch_decode(local_embeds, key, sampler_config)
-                cache_miss_count = count()
+        with jtu.count_pjit_cpp_cache_miss() as count:
+            output = self.jitted_patch_decode(local_embeds, key, sampler_config)
+            cache_miss_count = count()
         return output, cache_miss_count
