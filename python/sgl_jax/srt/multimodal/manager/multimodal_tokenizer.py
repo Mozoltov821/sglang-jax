@@ -848,7 +848,7 @@ class MultimodalTokenizer(TokenizerManager):
         # Official format: <|im_start|>user\n [AUDIO] {prompt} <|im_end|>\n<|im_start|>assistant\n
         
         prefix_text = "<|im_start|>user\n"
-        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n"
+        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
         
         prefix_ids = []
         suffix_ids = []
