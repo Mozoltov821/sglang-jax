@@ -139,10 +139,11 @@ class AudioBackboneModelRunner(BaseModelRunner):
             input_ids,
             forward_batch,
             token_to_kv_pool,
+            logits_metadata,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model.forward(input_ids, forward_batch, token_to_kv_pool)
+            return model.forward(input_ids, forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(
             jax.jit,
@@ -165,6 +166,7 @@ class AudioBackboneModelRunner(BaseModelRunner):
         def forward_wrapper(
             input_ids: jax.Array,
             forward_batch: ForwardBatch,
+            logits_metadata: LogitsMetadata,
         ):
             return forward(
                 model_def, 
@@ -172,7 +174,8 @@ class AudioBackboneModelRunner(BaseModelRunner):
                 model_state_leaves, 
                 input_ids, 
                 forward_batch, 
-                self.token_to_kv_pool
+                self.token_to_kv_pool,
+                logits_metadata
             )
 
         def patch_decode_wrapper(
@@ -218,44 +221,53 @@ class AudioBackboneModelRunner(BaseModelRunner):
         if positions is None:
             B, _, L = input_ids.shape
             positions = jnp.arange(L, dtype=jnp.int32)
-            # Add batch dim if needed? Positions usually [T] or [B, T].
-            # For RadixAttention, it expects flattened [Total_Tokens].
-            # Since B=1, [T] is fine.
         
         # Determine Forward Mode
-        # If starting from 0, it's EXTEND/PREFILL
         is_prefill = (positions[0] == 0)
         forward_mode = ForwardMode.EXTEND if is_prefill else ForwardMode.DECODE
         
         # Simple Request Pool Indexing: Identity map position -> pool index
-        # This assumes single request running linearly filling the cache
         req_pool_indices = positions
+        out_cache_loc = positions
         
         # Seq Lens: [B]
-        # Current length is last position + 1
         seq_lens = jnp.array([positions[-1] + 1], dtype=jnp.int32)
         
         # Construct ForwardBatch
-        # Note: RadixAttention expects flattened arrays
         forward_batch = ForwardBatch(
-            input_ids=None, # We pass custom input_ids separately
-            positions=positions,
+            bid=0, # Dummy bid
+            forward_mode=forward_mode,
+            batch_size=1,
+            input_ids=None,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            extend_start_loc=jnp.array([0], dtype=jnp.int32) if is_prefill else None,
+        )
+
+        # Construct LogitsMetadata
+        logits_metadata = LogitsMetadata(
             forward_mode=forward_mode,
-            # Add other required fields with defaults
-            out_cache_indices=None,
-            return_logprob=False,
-            top_logprobs_num=0,
-            token_to_kv_pool=self.token_to_kv_pool, # Optional reference
+            # For MiMo, we only care about the last token's logits for ASR
+            # In decode mode, total_num_tokens is 1. In prefill, it is L.
+            # LogitsProcessor usually needs to know which positions to extract.
+            # Qwen2 style expects extract_last_only logic.
         )
 
         import jax._src.test_util as jtu
 
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output = self.jitted_forward(input_ids, forward_batch)
+            # output is (text_logits, local_hidden_states, None, layers_kv_fused, layers_callback_flag)
+            text_logits, local_hidden_states, _, layers_kv_fused, _ = self.jitted_forward(
+                input_ids, forward_batch, logits_metadata
+            )
             cache_miss_count = count()
-        return output, cache_miss_count
+        
+        # Update KV Cache Buffer in Pool
+        self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
+        
+        return (text_logits, local_hidden_states, None), cache_miss_count
 
     def patch_decode(
         self,
@@ -280,11 +292,3 @@ class AudioBackboneModelRunner(BaseModelRunner):
             output = self.jitted_patch_decode(local_embeds, key, sampler_config)
             cache_miss_count = count()
         return output, cache_miss_count
-
-    def init_cache(self, batch_size: int) -> list:
-        """Initialize KV cache for main transformer."""
-        return self.model.model.init_cache(
-            batch_size,
-            self.model_config.max_position_embeddings,
-            jnp.bfloat16,
-        )

@@ -220,24 +220,31 @@ class MiMoAudioDecoderLayer(nnx.Module):
         self,
         hidden_states: jax.Array,
         positions: jax.Array,
-        attention_mask: Optional[jax.Array] = None,
-        cache: Optional[Tuple[jax.Array, jax.Array, int]] = None,
-    ) -> Tuple[jax.Array, Optional[Tuple[jax.Array, jax.Array, int]]]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        residual: jax.Array | None = None,
+    ) -> Tuple[jax.Array, jax.Array, jax.Array, list]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states += residual
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, new_cache = self.self_attn(
-            hidden_states, positions, attention_mask, cache
+        hidden_states, kv_fused = self.self_attn(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
         )
 
-        hidden_states = residual + hidden_states
+        hidden_states += residual
         residual = hidden_states
-
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
 
-        return hidden_states, new_cache
+        return hidden_states, residual, kv_fused, []
 
 
 class MiMoAudioTransformer(nnx.Module):
@@ -285,11 +292,12 @@ class MiMoAudioTransformer(nnx.Module):
                 rope_theta=rope_theta,
                 rms_norm_eps=rms_norm_eps,
                 mesh=mesh,
+                layer_id=i,
                 use_bias=use_bias,
                 use_causal_mask=use_causal_mask,
                 dtype=dtype,
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ])
 
         self.norm = RMSNorm(
@@ -301,65 +309,46 @@ class MiMoAudioTransformer(nnx.Module):
     def __call__(
         self,
         input_ids_or_embeds: jax.Array,
-        positions: jax.Array,
-        attention_mask: Optional[jax.Array] = None,
-        cache: Optional[list] = None,
-    ) -> Tuple[jax.Array, Optional[list]]:
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> Tuple[jax.Array, list, list]:
         """
         Args:
             input_ids_or_embeds: Token IDs [B, T] if has_embedder else embeddings [B, T, hidden_size]
-            positions: Position IDs [B, T] or [T]
-            attention_mask: Optional attention mask
-            cache: Optional list of layer caches
+            forward_batch: ForwardBatch info
+            token_to_kv_pool: KVCache pool
 
         Returns:
             hidden_states: [B, T, hidden_size]
-            new_cache: Updated cache list
+            layers_kv_fused: List of KV outputs
+            layers_callback_flag: Callback flags
         """
         if self.has_embedder and input_ids_or_embeds.ndim == 2 and jnp.issubdtype(input_ids_or_embeds.dtype, jnp.integer):
             hidden_states = self.embed_tokens(input_ids_or_embeds)
         else:
             hidden_states = input_ids_or_embeds
 
-        new_cache = [] if cache is not None else None
+        residual = None
+        layers_kv_fused = []
+        layers_callback_flag = []
 
-        for i, layer in enumerate(self.layers):
-            layer_cache = cache[i] if cache is not None else None
-            hidden_states, layer_new_cache = layer(
-                hidden_states, positions, attention_mask, layer_cache
+        for layer in self.layers:
+            hidden_states, residual, kv_fused, callback_flag = layer(
+                hidden_states,
+                forward_batch.positions,
+                forward_batch,
+                token_to_kv_pool,
+                residual,
             )
-            if new_cache is not None:
-                new_cache.append(layer_new_cache)
+            layers_kv_fused.append(kv_fused)
+            layers_callback_flag.extend(callback_flag)
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, new_cache
-
-    def init_cache(
-        self,
-        batch_size: int,
-        max_seq_len: int,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ) -> list:
-        """Initialize fixed-size KV cache for all layers.
-
-        Args:
-            batch_size: Batch size
-            max_seq_len: Maximum sequence length (pre-allocated size)
-            dtype: Data type for cache
-
-        Returns:
-            List of (k_cache, v_cache, cache_pos) tuples for each layer
-        """
-        cache = []
-        for layer in self.layers:
-            num_kv_heads = layer.self_attn.num_kv_heads
-            head_dim = layer.self_attn.head_dim
-            # Pre-allocate fixed-size cache
-            k_cache = jnp.zeros((batch_size, max_seq_len, num_kv_heads, head_dim), dtype=dtype)
-            v_cache = jnp.zeros((batch_size, max_seq_len, num_kv_heads, head_dim), dtype=dtype)
-            cache_pos = 0  # Current write position
-            cache.append((k_cache, v_cache, cache_pos))
-        return cache
+        
+        if residual is not None:
+            hidden_states += residual
+            
+        return hidden_states, layers_kv_fused, layers_callback_flag
 
 
 class MiMoAudioForCausalLM(nnx.Module):
@@ -491,6 +480,8 @@ class MiMoAudioForCausalLM(nnx.Module):
             mesh=mesh,
         )
 
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+
     def load_weights(self, model_config: ModelConfig):
         """Load weights from safetensors file."""
         loader = WeightLoader(
@@ -602,42 +593,49 @@ class MiMoAudioForCausalLM(nnx.Module):
     def forward(
         self,
         input_ids: jax.Array,
-        cache: Optional[list] = None,
-    ) -> Tuple[jax.Array, jax.Array, Optional[list]]:
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        logits_metadata: LogitsMetadata,
+    ) -> Tuple[jax.Array, jax.Array, None, list, list]:
         """Forward pass through main transformer.
 
         Args:
             input_ids: [B, 1 + audio_channels, seq_len]
-            cache: Optional KV cache
+            forward_batch: Batch metadata
+            token_to_kv_pool: KV Cache pool
+            logits_metadata: Metadata for logits processing
 
         Returns:
-            text_logits: [B, 1, vocab_size]
+            text_logits: LogitsProcessorOutput
             local_hidden_states: [B, 1, local_dim]
-            cache: Updated cache
+            cache: None (Managed by RadixAttention)
+            layers_kv_fused: KV outputs
+            layers_callback_flag: Callback flags
         """
-        text_input_ids = input_ids[:, 0, :: self.config.group_size]
-        B, T_groups = text_input_ids.shape
-
-        # Prepare input embeddings
+        # Prepare input embeddings (MiMo specific)
         inputs_embeds = self._prepare_input_embeds(input_ids)
-
-        # Create position IDs
-        positions = jnp.arange(T_groups)
+        
+        # Flatten embeddings for RadixAttention: [Total_Tokens, H]
+        B, T_groups, H = inputs_embeds.shape
+        inputs_embeds_flat = inputs_embeds.reshape(-1, H)
 
         # Forward through main transformer
-        hidden_states, cache = self.model(
-            inputs_embeds, positions, attention_mask=None, cache=cache
+        hidden_states, layers_kv_fused, layers_callback_flag = self.model(
+            inputs_embeds_flat, forward_batch, token_to_kv_pool
         )
+        
+        # Get logits for the last positions using LogitsProcessor
+        text_logits = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
 
-        # Get text logits from last position
-        text_logits, _ = self.lm_head(hidden_states[:, -1:, :])  # [B, 1, vocab_size]
-
+        # Reshape hidden_states back to [B, T_groups, H] to get local_hidden_states
+        hidden_states = hidden_states.reshape(B, T_groups, H)
+        
         # Downcast hidden states for local transformer
         local_hidden_states, _ = self.hidden_states_downcast(
             hidden_states[:, -1:, :]
         )  # [B, 1, local_dim]
 
-        return text_logits, local_hidden_states, cache
+        return text_logits, local_hidden_states, None, layers_kv_fused, layers_callback_flag
 
     def patch_decode(
         self,

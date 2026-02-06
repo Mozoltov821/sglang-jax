@@ -125,16 +125,16 @@ class AudioBackboneScheduler:
                 self._generate_asr_text(req, sampler_config)
             else:
                 # Forward through main transformer
-                (text_logits, local_hidden_states, cache), _ = self.backbone_worker.forward(
-                    req, cache=req.backbone_cache
+                (text_logits, local_hidden_states, _), _ = self.backbone_worker.forward(
+                    req
                 )
 
-                # Update cache for next iteration
-                req.backbone_cache = cache
-
                 # Sample text token
-                text_token = self._sample_token(text_logits[:, -1, :], sampler_config)
-                req.generated_text_tokens = text_token
+                # Note: For non-ASR, we might need a simpler sampler or reuse numpy logic
+                # For now, stay consistent with previous behavior but without cache
+                logits_np = np.array(jax.device_get(text_logits))
+                text_token_id = int(np.argmax(logits_np[:, -1, :], axis=-1)[0])
+                text_token = jnp.array([text_token_id], dtype=jnp.int32)
 
                 # Generate audio tokens using patch decoder
                 self.rng_key, subkey = jax.random.split(self.rng_key)
@@ -160,9 +160,6 @@ class AudioBackboneScheduler:
         max_new_tokens = getattr(req, "max_new_tokens", 256)
         generated_ids = []
         
-        # RadixAttention manages cache internally
-        cache = None
-        
         current_input_ids = req.input_ids
         current_pos = 0
 
@@ -173,7 +170,7 @@ class AudioBackboneScheduler:
         pos_sharding = NamedSharding(self.mesh, PartitionSpec())
 
         for step in range(max_new_tokens):
-            # Temporarily update request input_ids and cache for forward pass
+            # Temporarily update request input_ids for forward pass
             req.input_ids = current_input_ids
             
             # Calculate positions explicitly to avoid JIT concretization errors
@@ -183,10 +180,9 @@ class AudioBackboneScheduler:
             positions = device_array(positions_np, sharding=pos_sharding)
 
             # Forward pass
-            (text_logits, local_hidden_states, new_cache), _ = self.backbone_worker.forward(
-                req, cache=cache, positions=positions
+            (text_logits, local_hidden_states, _), _ = self.backbone_worker.forward(
+                req, positions=positions
             )
-            cache = new_cache
             
             # Update position
             current_pos += T_groups
