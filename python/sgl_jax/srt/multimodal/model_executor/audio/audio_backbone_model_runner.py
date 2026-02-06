@@ -247,6 +247,9 @@ class AudioBackboneModelRunner(BaseModelRunner):
             extend_start_loc=jnp.array([0], dtype=jnp.int32) if is_prefill else None,
         )
 
+        if self.token_to_kv_pool is None:
+            raise ValueError("Token pool is None")
+
         # Construct LogitsMetadata
         logits_metadata = LogitsMetadata(
             forward_mode=forward_mode,
