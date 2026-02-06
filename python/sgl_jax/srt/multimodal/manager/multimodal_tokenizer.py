@@ -935,9 +935,9 @@ class MultimodalTokenizer(TokenizerManager):
                 }
             ],
             "usage": {
-                "prompt_tokens": len(tokenized_ids),
+                "prompt_tokens": len(prefix_ids) + len(suffix_ids),
                 "completion_tokens": len(out.get("generated_text_tokens", [])),
-                "total_tokens": len(tokenized_ids) + len(out.get("generated_text_tokens", [])),
+                "total_tokens": len(prefix_ids) + len(suffix_ids) + len(out.get("generated_text_tokens", [])),
             }
         }
 
