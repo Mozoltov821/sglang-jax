@@ -178,6 +178,9 @@ class AudioBackboneScheduler:
             next_token = self._sample_token(text_logits[:, -1, :], sampler_config)
             next_token_scalar = jax.device_get(next_token).item()
             
+            if len(generated_ids) == 0:
+                logger.info("ASR first token id: %s", next_token_scalar)
+            
             # TODO: Handle EOS token properly (need access to tokenizer config)
             # For now assume 151672 (MIMO_EOT_IDX) or 151643 (<|endoftext|>)
             if next_token_scalar in (151672, 151643):
