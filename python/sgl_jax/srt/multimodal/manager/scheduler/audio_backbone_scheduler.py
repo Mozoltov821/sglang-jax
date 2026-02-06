@@ -174,6 +174,10 @@ class AudioBackboneScheduler:
             )
             cache = new_cache
 
+            # Force text generation by masking out the empty token
+            # This prevents the model from switching to audio generation mode
+            text_logits = text_logits.at[:, -1, MIMO_EMPTY_IDX].set(-float('inf'))
+
             # Sample token
             next_token = self._sample_token(text_logits[:, -1, :], sampler_config)
             next_token_scalar = jax.device_get(next_token).item()
