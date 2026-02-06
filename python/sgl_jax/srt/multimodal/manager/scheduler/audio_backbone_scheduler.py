@@ -175,13 +175,27 @@ class AudioBackboneScheduler:
             )
             cache = new_cache
 
+            # Move to CPU for sampling to avoid ShardingTypeError and allow easy masking
+            logits_np = np.array(jax.device_get(text_logits))
+            
             # Force text generation by masking out the empty token
-            # This is crucial for ASR/Text-Chat to prevent the model from generating audio
-            text_logits = text_logits.at[:, -1, MIMO_EMPTY_IDX].set(-float('inf'))
+            logits_np[:, -1, MIMO_EMPTY_IDX] = -float('inf')
 
-            # Sample token
-            next_token = self._sample_token(text_logits[:, -1, :], sampler_config)
-            next_token_scalar = jax.device_get(next_token).item()
+            # Sample token (NumPy implementation)
+            if sampler_config.do_sample:
+                # Apply temperature
+                logits = logits_np[:, -1, :] / max(sampler_config.temperature, 1e-5)
+                # Numerical stability for softmax
+                logits = logits - np.max(logits, axis=-1, keepdims=True)
+                probs = np.exp(logits)
+                probs /= np.sum(probs, axis=-1, keepdims=True)
+                
+                # Sample
+                next_token_scalar = np.random.choice(probs.shape[-1], p=probs[0])
+            else:
+                next_token_scalar = np.argmax(logits_np[:, -1, :], axis=-1)[0]
+            
+            next_token_scalar = int(next_token_scalar)
             
             logger.info("Step %d result: token id: %s", step, next_token_scalar)
             
