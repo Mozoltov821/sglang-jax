@@ -73,30 +73,32 @@ class AudioBackboneScheduler:
         Repeatedly polls the communication_backend for requests, processes them
         through the backbone model, and sends results to the next stage.
         """
-        while True:
-            reqs = self._comm_backend.recv_requests()
-            if len(reqs) > 0:
-                valid_reqs = []
-                for req in reqs:
-                    if isinstance(req, AbortReq):
-                        logger.info("AudioBackboneScheduler received abort for rid=%s", req.rid)
-                        self.aborted_rids.add(req.rid)
-                    elif isinstance(req, Req):
-                        if req.rid in self.aborted_rids:
-                            logger.info(
-                                "AudioBackboneScheduler skipping aborted request rid=%s", req.rid
+        # Set mesh context for all JAX operations (required for shard_map, KV cache updates, etc.)
+        with self.mesh:
+            while True:
+                reqs = self._comm_backend.recv_requests()
+                if len(reqs) > 0:
+                    valid_reqs = []
+                    for req in reqs:
+                        if isinstance(req, AbortReq):
+                            logger.info("AudioBackboneScheduler received abort for rid=%s", req.rid)
+                            self.aborted_rids.add(req.rid)
+                        elif isinstance(req, Req):
+                            if req.rid in self.aborted_rids:
+                                logger.info(
+                                    "AudioBackboneScheduler skipping aborted request rid=%s", req.rid
+                                )
+                                self.aborted_rids.discard(req.rid)
+                                continue
+                            self.preprocess(req)
+                            valid_reqs.append(req)
+                        else:
+                            logger.warning(
+                                "AudioBackboneScheduler received unknown request type: %s", type(req)
                             )
-                            self.aborted_rids.discard(req.rid)
-                            continue
-                        self.preprocess(req)
-                        valid_reqs.append(req)
-                    else:
-                        logger.warning(
-                            "AudioBackboneScheduler received unknown request type: %s", type(req)
-                        )
 
-                if valid_reqs:
-                    self.run_backbone_batch(valid_reqs)
+                    if valid_reqs:
+                        self.run_backbone_batch(valid_reqs)
 
     def preprocess(self, req: Req):
         """Apply preprocessing to a single Req.
