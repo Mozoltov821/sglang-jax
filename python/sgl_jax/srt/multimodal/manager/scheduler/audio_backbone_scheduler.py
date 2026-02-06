@@ -17,6 +17,7 @@ from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import MiMo
 from sgl_jax.srt.multimodal.manager.schedule_batch import (
     MIMO_AUDIO_CHANNELS,
     MIMO_AUDIO_GROUP_SIZE,
+    MIMO_EMPTY_IDX,
     MIMO_SPEECH_EMPTY_IDS,
     MIMO_TEXT_PADDING,
     Req,
