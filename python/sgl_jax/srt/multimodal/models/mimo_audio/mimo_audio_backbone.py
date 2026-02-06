@@ -720,8 +720,8 @@ class MiMoAudioForCausalLM(nnx.Module):
         for t in range(delay_iters):
             positions = jnp.array([t])
 
-            # Forward through patch decoder without cache for now (simpler, avoids sharding issues)
-            hidden_state, _, _ = self.patch_decoder(local_embeds, positions, cache=None)
+            # Forward through patch decoder without cache (simpler, avoids sharding issues)
+            hidden_state, _, _ = self.patch_decoder(local_embeds, positions)
 
             next_local_embeds = jnp.zeros_like(local_embeds)
 

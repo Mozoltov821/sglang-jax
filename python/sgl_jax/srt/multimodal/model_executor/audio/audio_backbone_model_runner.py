@@ -52,6 +52,7 @@ class AudioBackboneModelRunner(BaseModelRunner):
 
     def initialize(self):
         self.load_model()
+        self.page_size = 1  # Set before init_attention_backend which uses it
         self.init_attention_backend()
         self.init_memory_pool()
         self.initialize_jit()
