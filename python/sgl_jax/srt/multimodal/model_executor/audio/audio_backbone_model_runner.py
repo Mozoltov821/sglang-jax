@@ -292,15 +292,16 @@ class AudioBackboneModelRunner(BaseModelRunner):
 
         import jax._src.test_util as jtu
 
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            # output is (text_logits, local_hidden_states, None, layers_kv_fused, layers_callback_flag)
-            text_logits, local_hidden_states, _, layers_kv_fused, _ = self.jitted_forward(
-                input_ids, forward_batch, logits_metadata
-            )
-            cache_miss_count = count()
-        
-        # Update KV Cache Buffer in Pool
-        self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
+        with self.mesh:
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                # output is (text_logits, local_hidden_states, None, layers_kv_fused, layers_callback_flag)
+                text_logits, local_hidden_states, _, layers_kv_fused, _ = self.jitted_forward(
+                    input_ids, forward_batch, logits_metadata
+                )
+                cache_miss_count = count()
+
+            # Update KV Cache Buffer in Pool
+            self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
         
         return (text_logits, local_hidden_states, None), cache_miss_count
 
@@ -323,7 +324,8 @@ class AudioBackboneModelRunner(BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            output = self.jitted_patch_decode(local_embeds, key, sampler_config)
-            cache_miss_count = count()
+        with self.mesh:
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                output = self.jitted_patch_decode(local_embeds, key, sampler_config)
+                cache_miss_count = count()
         return output, cache_miss_count
