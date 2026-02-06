@@ -44,6 +44,7 @@ dependencies = [
     "pybase64",
     "omegaconf",
     "imageio[ffmpeg]",
+    "librosa",
 ]
 
 [project.optional-dependencies]
