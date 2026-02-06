@@ -156,7 +156,7 @@ class AudioBackboneScheduler:
 
     def _generate_asr_text(self, req: Req, sampler_config: MiMoSamplerConfig):
         """Autoregressive text generation for ASR mode."""
-        max_new_tokens = 256
+        max_new_tokens = getattr(req, "max_new_tokens", 256)
         generated_ids = []
         cache = None
         current_input_ids = req.input_ids

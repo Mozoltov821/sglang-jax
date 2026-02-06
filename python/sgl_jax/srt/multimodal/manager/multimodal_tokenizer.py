@@ -884,6 +884,7 @@ class MultimodalTokenizer(TokenizerManager):
             sample_rate=24000,
             prompt=prompt_text,
             n_q=8,
+            max_new_tokens=obj.max_tokens or 256,
         )
 
         state = MMReqState(
