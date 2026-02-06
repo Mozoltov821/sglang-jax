@@ -434,8 +434,11 @@ class Req:
             audio_codes = jnp.concatenate([audio_codes, padding], axis=1)
             T_audio = audio_codes.shape[1]
 
-        # Text channel: all timesteps filled with <|empty|> token
-        text_row = jnp.full((T_audio,), MIMO_EMPTY_IDX, dtype=jnp.int32)
+        # Text channel: [Empty, -100, -100, -100] pattern
+        # Initialize with -100 (padding)
+        text_row = jnp.full((T_audio,), MIMO_TEXT_PADDING, dtype=jnp.int32)
+        # Set every group_size-th element to Empty
+        text_row = text_row.at[::MIMO_AUDIO_GROUP_SIZE].set(MIMO_EMPTY_IDX)
 
         # Concatenate text row with audio codes
         return jnp.concatenate(
