@@ -13,6 +13,7 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
