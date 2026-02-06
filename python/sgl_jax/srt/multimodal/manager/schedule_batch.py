@@ -329,7 +329,9 @@ class Req:
                 segments.append(self._build_text_segment(self.prompt_input_ids))
                 
             if self.audio_codes is not None:
+                segments.append(self._build_sosp_segment())
                 segments.append(self._build_audio_segment(self.audio_codes))
+                segments.append(self._build_eosp_segment())
 
             if self.text_input_ids:
                 segments.append(self._build_text_segment(self.text_input_ids))
@@ -340,7 +342,9 @@ class Req:
                 segments.append(self._build_text_segment(self.prompt_input_ids))
 
             if self.audio_codes is not None:
+                segments.append(self._build_sosp_segment())
                 segments.append(self._build_audio_segment(self.audio_codes))
+                segments.append(self._build_eosp_segment())
 
             if self.text_input_ids:
                 segments.append(self._build_text_segment(self.text_input_ids))
@@ -420,7 +424,15 @@ class Req:
         if isinstance(audio_codes, np.ndarray):
             audio_codes = jnp.array(audio_codes)
 
+        # Pad audio codes to be a multiple of group size by repeating the last frame
         T_audio = audio_codes.shape[1]
+        remainder = T_audio % MIMO_AUDIO_GROUP_SIZE
+        if remainder != 0:
+            padding_needed = MIMO_AUDIO_GROUP_SIZE - remainder
+            last_col = audio_codes[:, -1:]
+            padding = jnp.tile(last_col, (1, padding_needed))
+            audio_codes = jnp.concatenate([audio_codes, padding], axis=1)
+            T_audio = audio_codes.shape[1]
 
         # Text channel: all timesteps filled with <|empty|> token
         text_row = jnp.full((T_audio,), MIMO_EMPTY_IDX, dtype=jnp.int32)
