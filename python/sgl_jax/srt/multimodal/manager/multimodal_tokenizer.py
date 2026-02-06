@@ -13,6 +13,7 @@ from typing import Any
 import fastapi
 import numpy as np
 import psutil
+import requests
 import setproctitle
 from transformers import AutoImageProcessor
 
@@ -25,6 +26,7 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioGenerationResponse,
     DataType,
     GenerateMMReqInput,
+    GenerateOpenAIAudioInput,
     TokenizedGenerateMMReqInput,
     TTSRequest,
     TTSResponse,
@@ -66,20 +68,17 @@ class MultimodalTokenizer(TokenizerManager):
     def __init__(self, server_args, port_args):
         """Initialize tokenizer, processor and result dispatcher.
 
-        Loads an image processor (best-effort), initializes an in-memory
+        Loads processors for different modalities, initializes an in-memory
         map `rid_to_state` to track request state objects, and prepares a
         result dispatcher that routes batches of outputs back to
         `_handle_batch_output`.
         """
         super().__init__(server_args, port_args)
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
-        # Use slow image processor to avoid torchvision dependency warning
-        try:
-            self.mm_processor = AutoImageProcessor.from_pretrained(
-                server_args.model_path, use_fast=False
-            )
-        except Exception:
-            logger.warning("Failed to load image processor from %s", server_args.model_path)
+        
+        # Initialize processors for vision and audio
+        self.image_processor = None
+        self._init_image_processor(server_args.model_path)
 
         # Initialize audio processor (WhisperFeatureExtractor) for audio models
         self.audio_processor = None
@@ -98,6 +97,16 @@ class MultimodalTokenizer(TokenizerManager):
                 ),
             ]
         )
+
+    def _init_image_processor(self, model_path: str):
+        """Initialize image processor for multimodal models."""
+        try:
+            # Use slow image processor to avoid torchvision dependency warning
+            self.image_processor = AutoImageProcessor.from_pretrained(
+                model_path, use_fast=False
+            )
+        except Exception:
+            logger.warning("Failed to load image processor from %s", model_path)
 
     def _init_audio_processor(self, model_path: str):
         """Initialize audio processor for audio models using transformers FeatureExtractor.
@@ -777,6 +786,158 @@ class MultimodalTokenizer(TokenizerManager):
             id=rid,
             text=text,
         )
+
+    async def chat_completion_audio(
+        self,
+        obj: GenerateOpenAIAudioInput,
+        request: fastapi.Request | None = None,
+    ):
+        """OpenAI-compatible chat completion for multimodal audio.
+
+        Args:
+            obj: GenerateOpenAIAudioInput containing messages and audio config.
+            request: FastAPI request object.
+
+        Returns:
+            A dict formatted as an OpenAI Chat Completion response.
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+
+        rid = uuid.uuid4().hex
+
+        # 1. Parse messages to extract prompt and audio
+        prompt_text = ""
+        audio_data_bytes = None
+        
+        for msg in obj.messages:
+            if isinstance(msg.content, str):
+                if msg.role == "user":
+                    prompt_text += msg.content + "\n"
+            elif isinstance(msg.content, list):
+                for part in msg.content:
+                    if part.type == "text":
+                        prompt_text += part.text + "\n"
+                    elif part.type == "input_audio":
+                        # We only support one audio input for now (MiMo Audio limitation)
+                        if part.input_audio:
+                            if part.input_audio.data:
+                                try:
+                                    audio_data_bytes = base64.b64decode(part.input_audio.data)
+                                except Exception:
+                                    logger.warning("Failed to decode base64 audio in chat_completion")
+                            elif part.input_audio.url:
+                                try:
+                                    # Download audio from URL
+                                    logger.info("Downloading audio from URL: %s", part.input_audio.url)
+                                    # Using a timeout to prevent hanging
+                                    resp = requests.get(part.input_audio.url, timeout=30)
+                                    resp.raise_for_status()
+                                    audio_data_bytes = resp.content
+                                    logger.info("Downloaded %d bytes", len(audio_data_bytes))
+                                except Exception as e:
+                                    logger.warning("Failed to download audio from URL: %s", e)
+
+        # 2. Apply chat template to prompt
+        if self.tokenizer:
+            try:
+                # Use standard chat template logic
+                messages = [{"role": "user", "content": prompt_text.strip()}]
+                if hasattr(self.tokenizer, "apply_chat_template"):
+                    formatted_prompt = self.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    if formatted_prompt:
+                        prompt_text = formatted_prompt
+                else:
+                    # Manual fallback
+                    prompt_text = f"<|im_start|>user\n{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n"
+            except Exception as e:
+                logger.warning("Chat template error in chat_completion_audio: %s", e)
+            
+            tokenized_ids = self.tokenizer(prompt_text)["input_ids"]
+        else:
+            tokenized_ids = []
+
+        # 3. Process audio if present
+        mel_input = None
+        mel_input_lens = None
+        if audio_data_bytes:
+            # Use our smart loader (handles WAV/MP3/etc.)
+            audio_array = self._load_audio_from_bytes(audio_data_bytes)
+            mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
+        # 4. Create internal Req and send to scheduler
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+        
+        # We use audio_understanding mode for general chat with audio
+        internal_req = Req(
+            rid=rid,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
+            audio_mode="audio_understanding",
+            text_input_ids=tokenized_ids,
+            data_type=DataType.AUDIO,
+            sample_rate=24000,
+            prompt=prompt_text,
+            n_q=8,
+        )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(internal_req)
+
+        # 5. Wait for result
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"Chat completion request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+
+        # 6. Format response as OpenAI Chat Completion
+        result_text = out.get("text", "")
+        
+        # Extract raw tokens if text is empty (debug fallback)
+        if not result_text and out.get("generated_text_tokens") is not None and self.tokenizer is not None:
+            tokens = out["generated_text_tokens"]
+            if hasattr(tokens, "tolist"):
+                tokens = tokens.tolist()
+            result_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+        return {
+            "id": f"chatcmpl-{rid}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": obj.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": result_text,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(tokenized_ids),
+                "completion_tokens": len(out.get("generated_text_tokens", [])),
+                "total_tokens": len(tokenized_ids) + len(out.get("generated_text_tokens", [])),
+            }
+        }
 
 
 def run_multimodal_tokenizer_process(
