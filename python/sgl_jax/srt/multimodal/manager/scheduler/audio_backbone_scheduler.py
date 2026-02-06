@@ -58,14 +58,17 @@ class AudioBackboneScheduler:
         """
         self._comm_backend = communication_backend
         self.mesh = mesh
-        self.backbone_worker = AudioBackboneModelWorker(
-            model_class=model_class, mesh=self.mesh, server_args=server_args
-        )
         self.server_args = server_args
         self.aborted_rids: set[str] = set()
 
         # Random key for sampling
         self.rng_key = jax.random.PRNGKey(42)
+
+        # Create worker within mesh context so JIT functions are traced with mesh available
+        with self.mesh:
+            self.backbone_worker = AudioBackboneModelWorker(
+                model_class=model_class, mesh=self.mesh, server_args=server_args
+            )
 
     def event_loop_normal(self):
         """Main blocking loop for processing requests.
