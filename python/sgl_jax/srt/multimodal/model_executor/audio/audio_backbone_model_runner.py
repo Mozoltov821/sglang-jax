@@ -13,7 +13,6 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
-from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
 from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -62,26 +61,13 @@ class AudioBackboneModelRunner(BaseModelRunner):
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
-        # Fallback on CPU: FlashAttention does not support CPU
-        backend = self.server_args.attention_backend
-        if self.server_args.device == "cpu" and backend == "fa":
-            backend = "native"
-        if backend == "native":
-            return NativeAttention(
-                self.model_config.num_attention_heads,
-                self.model_config.num_key_value_heads,
-                self.mesh,
-            )
-        elif backend == "fa":
-            return FlashAttention(
-                self.model_config.num_attention_heads,
-                self.model_config.num_key_value_heads,
-                self.model_config.head_dim,
-                page_size=self.page_size,
-                mesh=self.mesh,
-            )
-        else:
-            raise ValueError(f"Unsupported attention backend: {backend}")
+        # Force NativeAttention for MiMo Audio backbone to avoid shard_map mesh context issues
+        # FlashAttention uses jax.shard_map which requires mesh context during JIT tracing
+        return NativeAttention(
+            self.model_config.num_attention_heads,
+            self.model_config.num_key_value_heads,
+            self.mesh,
+        )
 
     def init_memory_pool(self):
         """Initialize memory pool for KV cache."""
@@ -158,41 +144,43 @@ class AudioBackboneModelRunner(BaseModelRunner):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
-        @partial(
-            jax.jit,
-            donate_argnames=["token_to_kv_pool"],
-            static_argnames=["model_state_def"],
-        )
-        def forward(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            input_ids,
-            forward_batch,
-            token_to_kv_pool,
-            logits_metadata,
-        ):
-            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            model = nnx.merge(model_def, model_state)
-            return model.forward(input_ids, forward_batch, token_to_kv_pool, logits_metadata)
+        # Define JIT functions within mesh context so shard_map can access mesh
+        with self.mesh:
+            @partial(
+                jax.jit,
+                donate_argnames=["token_to_kv_pool"],
+                static_argnames=["model_state_def"],
+            )
+            def forward(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                input_ids,
+                forward_batch,
+                token_to_kv_pool,
+                logits_metadata,
+            ):
+                model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+                model = nnx.merge(model_def, model_state)
+                return model.forward(input_ids, forward_batch, token_to_kv_pool, logits_metadata)
 
-        @partial(
-            jax.jit,
-            static_argnames=["model_state_def", "do_sample", "temperature"],
-        )
-        def patch_decode(
-            model_def,
-            model_state_def,
-            model_state_leaves,
-            local_embeds,
-            key,
-            do_sample,
-            temperature,
-        ):
-            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
-            model = nnx.merge(model_def, model_state)
-            sampler_config = MiMoSamplerConfig(do_sample=do_sample, temperature=temperature)
-            return model.patch_decode(local_embeds, key, sampler_config)
+            @partial(
+                jax.jit,
+                static_argnames=["model_state_def", "do_sample", "temperature"],
+            )
+            def patch_decode(
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                local_embeds,
+                key,
+                do_sample,
+                temperature,
+            ):
+                model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+                model = nnx.merge(model_def, model_state)
+                sampler_config = MiMoSamplerConfig(do_sample=do_sample, temperature=temperature)
+                return model.patch_decode(local_embeds, key, sampler_config)
 
         def forward_wrapper(
             input_ids: jax.Array,
@@ -200,11 +188,11 @@ class AudioBackboneModelRunner(BaseModelRunner):
             logits_metadata: LogitsMetadata,
         ):
             return forward(
-                model_def, 
-                model_state_def, 
-                model_state_leaves, 
-                input_ids, 
-                forward_batch, 
+                model_def,
+                model_state_def,
+                model_state_leaves,
+                input_ids,
+                forward_batch,
                 self.token_to_kv_pool,
                 logits_metadata
             )
