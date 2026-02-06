@@ -567,7 +567,7 @@ class MiMoAudioForCausalLM(nnx.Module):
         positions = jnp.arange(group_size)
 
         # Process through patch encoder
-        output, _ = self.patch_encoder(input_embeddings, positions)
+        output, _, _ = self.patch_encoder(input_embeddings, positions)
 
         # Reshape back: [B, T_groups, group_size, hidden_size]
         return output.reshape(B, T_groups, group_size, hidden_size)
