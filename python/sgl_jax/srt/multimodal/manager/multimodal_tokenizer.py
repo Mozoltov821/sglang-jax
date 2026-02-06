@@ -82,6 +82,7 @@ class MultimodalTokenizer(TokenizerManager):
 
         # Initialize audio processor (WhisperFeatureExtractor) for audio models
         self.audio_processor = None
+        self.audio_config = {}
         self._init_audio_processor(server_args.model_path)
 
         self.rid_to_state: dict[str, MMReqState] = {}
@@ -159,6 +160,7 @@ class MultimodalTokenizer(TokenizerManager):
                     config = json.load(f)
 
                 if "n_mels" in config and "sampling_rate" in config:
+                    self.audio_config = config
                     # Use transformers WhisperFeatureExtractor (numpy-based, no JAX dependency)
                     from transformers import WhisperFeatureExtractor
 
@@ -180,41 +182,71 @@ class MultimodalTokenizer(TokenizerManager):
         logger.warning("Could not initialize audio processor")
 
     def _preprocess_audio_to_mel(self, audio_array: np.ndarray) -> tuple:
-        """Convert raw audio waveform to mel spectrogram using WhisperFeatureExtractor.
-
+        """Convert raw audio waveform to mel spectrogram matching MiMo Audio implementation.
+        
         Args:
             audio_array: Raw audio waveform as numpy array, shape (samples,).
 
         Returns:
             Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
             mel_spectrogram shape: [batch, time, n_mels]
-            Note: Returns numpy arrays to avoid JAX initialization in tokenizer process.
         """
-        if self.audio_processor is None:
-            raise ValueError("Audio processor not initialized. Cannot preprocess audio.")
+        if not self.audio_config:
+            raise ValueError("Audio config not loaded.")
 
-        # WhisperFeatureExtractor expects 1D array or list of 1D arrays
+        import librosa
+
+        # Ensure 1D array
         if audio_array.ndim == 2:
             audio_array = audio_array.squeeze(0)
+        
+        # 1. STFT (center=True matches torchaudio default/MiMo implementation)
+        n_fft = self.audio_config.get("nfft", 960)
+        hop_length = self.audio_config.get("hop_length", 240)
+        win_length = self.audio_config.get("window_size", 960)
+        sr = self.audio_config.get("sampling_rate", 24000)
+        n_mels = self.audio_config.get("n_mels", 128)
+        fmin = self.audio_config.get("fmin", 0.0)
+        fmax = self.audio_config.get("fmax", None) # None implies sr / 2
 
-        # Extract mel features using WhisperFeatureExtractor
-        # IMPORTANT: Set padding=False to prevent automatic padding to 30 seconds
-        # Returns dict with 'input_features' key, shape [batch, n_mels, time]
-        features = self.audio_processor(
-            audio_array,
-            sampling_rate=self.audio_processor.sampling_rate,
-            return_tensors="np",
-            padding=False,  # Do not pad to fixed length
+        # STFT
+        D = librosa.stft(
+            audio_array, 
+            n_fft=n_fft, 
+            hop_length=hop_length, 
+            win_length=win_length,
+            center=True,
+            window="hann" # default
         )
-        mels = features["input_features"]  # shape: [batch, n_mels, time]
+        mag = np.abs(D) # Magnitude (power=1.0)
 
-        # Transpose to [batch, time, n_mels] - stay in numpy, no JAX
-        mels = np.transpose(mels, (0, 2, 1))  # [batch, time, n_mels]
+        # 2. Mel Filter
+        mel_basis = librosa.filters.mel(
+            sr=sr,
+            n_fft=n_fft,
+            n_mels=n_mels,
+            fmin=fmin,
+            fmax=fmax,
+            htk=False, # torchaudio uses htk=False by default for melscale
+            norm="slaney" # torchaudio default
+        )
+        
+        mels = np.dot(mel_basis, mag)
+        
+        # 3. Log (Natural Log, Base e) - CRITICAL DIFFERENCE from Whisper (Base 10)
+        # Official: torch.log(torch.clip(spec, min=1e-7))
+        mels = np.log(np.clip(mels, a_min=1e-7, a_max=None))
+        
+        # 4. Transpose to [batch, time, n_mels]
+        # Current shape: [n_mels, time]
+        mels = mels.T # [time, n_mels]
+        mels = mels[np.newaxis, :, :] # [1, time, n_mels]
+        
         input_lens = np.array([mels.shape[1]])
 
-        logger.warning(
-            "Audio preprocessing: input_samples=%d, mel_shape=%s, input_lens=%s",
-            len(audio_array) if audio_array.ndim == 1 else audio_array.shape[-1],
+        logger.info(
+            "Audio preprocessing (Manual Librosa): input_samples=%d, mel_shape=%s, input_lens=%s",
+            len(audio_array),
             mels.shape,
             input_lens,
         )
