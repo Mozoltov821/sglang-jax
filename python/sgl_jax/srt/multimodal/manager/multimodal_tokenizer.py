@@ -237,11 +237,14 @@ class MultimodalTokenizer(TokenizerManager):
 
                 out_data = {"success": True, "meta_info": {}}
                 if hasattr(req, "audio_mode") and req.audio_mode is not None:
-                    if req.audio_mode == "asr" and req.generated_text_tokens is not None:
+                    if req.audio_mode in ("asr", "audio_understanding") and req.generated_text_tokens is not None:
                         # Decode generated text tokens to string
                         tokens = req.generated_text_tokens
                         if hasattr(tokens, "tolist"):
                             tokens = tokens.tolist()
+                        
+                        # Store raw tokens for usage calculation
+                        out_data["generated_text_tokens"] = tokens
                         
                         logger.info("ASR generated tokens: %s", tokens)
                         
