@@ -51,30 +51,6 @@ class VideoResponse(BaseModel):
     path: str | None = None
 
 
-class AudioEncodeRequest(BaseModel):
-    audio_data: str  # base64 encoded audio
-    sample_rate: int = 24000
-    use_quantizer: bool = True
-    n_q: int | None = None
-
-
-class AudioDecodeRequest(BaseModel):
-    codes: list[list[int]]  # [n_q, seq_len]
-
-
-class AudioEncodeResponse(BaseModel):
-    id: str
-    codes: list[list[int]] | None = None
-    hidden_states_shape: list[int] | None = None
-
-
-class AudioDecodeResponse(BaseModel):
-    id: str
-    audio_data: str | None = None       # base64 编码的音频
-    url: str | None = None              # 文件路径 (当 save_output=True)
-    sample_rate: int = 24000
-
-
 class AudioGenerationRequest(BaseModel):
     audio_data: str
     prompt: str | None = None

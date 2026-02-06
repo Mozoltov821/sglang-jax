@@ -19,10 +19,6 @@ from sgl_jax.srt.multimodal.manager.global_scheduler import run_global_scheduler
 from sgl_jax.srt.multimodal.manager.io_struct import (
     ASRRequest,
     ASRResponse,
-    AudioDecodeRequest,
-    AudioDecodeResponse,
-    AudioEncodeRequest,
-    AudioEncodeResponse,
     AudioGenerationRequest,
     AudioGenerationResponse,
     DataType,
@@ -96,30 +92,6 @@ async def videos_generation(obj: VideoGenerationsRequest, request: Request):
         return ret
     except ValueError as e:
         logger.error("[http_server] Error: %s", e)
-        return _create_error_response(e)
-
-
-@app.api_route("/api/v1/audio/encode", methods=["POST"])
-async def audio_encode(obj: AudioEncodeRequest, request: Request):
-    try:
-        from sgl_jax.srt.entrypoints.http_server import _global_state
-
-        ret = await _global_state.tokenizer_manager.encode_audio(obj, request)
-        return ret
-    except ValueError as e:
-        logger.error("[http_server] audio_encode error: %s", e)
-        return _create_error_response(e)
-
-
-@app.api_route("/api/v1/audio/decode", methods=["POST"])
-async def audio_decode(obj: AudioDecodeRequest, request: Request):
-    try:
-        from sgl_jax.srt.entrypoints.http_server import _global_state
-
-        ret = await _global_state.tokenizer_manager.decode_audio(obj, request)
-        return ret
-    except ValueError as e:
-        logger.error("[http_server] audio_decode error: %s", e)
         return _create_error_response(e)
 
 
