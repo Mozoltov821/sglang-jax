@@ -170,31 +170,34 @@ class AudioBackboneScheduler:
             req.input_ids = current_input_ids
             
             # Forward pass
-            (text_logits, _, new_cache), _ = self.backbone_worker.forward(
+            (text_logits, local_hidden_states, new_cache), _ = self.backbone_worker.forward(
                 req, cache=cache
             )
             cache = new_cache
-
-            # Force text generation by masking out the empty token
-            # This prevents the model from switching to audio generation mode
-            text_logits = text_logits.at[:, -1, MIMO_EMPTY_IDX].set(-float('inf'))
 
             # Sample token
             next_token = self._sample_token(text_logits[:, -1, :], sampler_config)
             next_token_scalar = jax.device_get(next_token).item()
             
-            # if len(generated_ids) == 0:
-            logger.info("第%d步推理结果： token id: %s", step,next_token_scalar)
+            logger.info("Step %d result: token id: %s", step, next_token_scalar)
             
-            # TODO: Handle EOS token properly (need access to tokenizer config)
-            # For now assume 151672 (MIMO_EOT_IDX) or 151643 (<|endoftext|>)
-            if next_token_scalar in (151672, 151643):
+            # Stop on EOT, EOS, IM_END, EOSTM
+            if next_token_scalar in (151672, 151643, 151645, 151671):
                 break
                 
             generated_ids.append(next_token_scalar)
 
+            # Check if we need to generate audio
+            audio_tokens = None
+            if next_token_scalar == MIMO_EMPTY_IDX:
+                self.rng_key, subkey = jax.random.split(self.rng_key)
+                audio_tokens, _ = self.backbone_worker.patch_decode(
+                    local_hidden_states, subkey, sampler_config
+                )
+                audio_tokens = jax.device_get(audio_tokens)
+
             # Prepare input for next step
-            current_input_ids = self._build_next_step_input(next_token_scalar)
+            current_input_ids = self._build_next_step_input(next_token_scalar, audio_tokens)
             current_input_ids = device_array(current_input_ids, sharding=sharding)
         
         # Use numpy array to avoid JAX initialization in detokenizer process
@@ -205,17 +208,26 @@ class AudioBackboneScheduler:
         req.input_ids = None
         req.backbone_cache = None
 
-    def _build_next_step_input(self, token_id: int) -> jax.Array:
+    def _build_next_step_input(self, token_id: int, audio_tokens: Optional[np.ndarray] = None) -> jax.Array:
         """Build input_ids for a single text token step [1, 9, group_size]."""
         # Text row: [token, -100, -100, -100]
         text_row = [token_id] + [MIMO_TEXT_PADDING] * (MIMO_AUDIO_GROUP_SIZE - 1)
         text_row = jnp.array(text_row, dtype=jnp.int32)
 
         rows = [text_row]
-        # Audio rows: filled with speech_empty_ids
-        for ch in range(MIMO_AUDIO_CHANNELS):
-            row = jnp.full((MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32)
-            rows.append(row)
+        
+        if audio_tokens is not None:
+            # audio_tokens: [B, group_size, audio_channels] -> we need [audio_channels, group_size]
+            # Take first batch item (batch size 1 assumed for loop)
+            # Transpose to [audio_channels, group_size]
+            audio_rows = audio_tokens[0].T.astype(jnp.int32)
+            for i in range(MIMO_AUDIO_CHANNELS):
+                rows.append(audio_rows[i])
+        else:
+            # Audio rows: filled with speech_empty_ids
+            for ch in range(MIMO_AUDIO_CHANNELS):
+                row = jnp.full((MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32)
+                rows.append(row)
         
         # Stack and add batch dim: [1, 9, group_size]
         return jnp.stack(rows, axis=0)[None, :, :]
