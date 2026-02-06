@@ -13,6 +13,8 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
+from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
@@ -50,8 +52,35 @@ class AudioBackboneModelRunner(BaseModelRunner):
 
     def initialize(self):
         self.load_model()
+        self.init_attention_backend()
         self.init_memory_pool()
         self.initialize_jit()
+
+    def init_attention_backend(self):
+        """Init attention kernel backend."""
+        self.attn_backend = self._get_attention_backend()
+
+    def _get_attention_backend(self):
+        # Fallback on CPU: FlashAttention does not support CPU
+        backend = self.server_args.attention_backend
+        if self.server_args.device == "cpu" and backend == "fa":
+            backend = "native"
+        if backend == "native":
+            return NativeAttention(
+                self.model_config.num_attention_heads,
+                self.model_config.num_key_value_heads,
+                self.mesh,
+            )
+        elif backend == "fa":
+            return FlashAttention(
+                self.model_config.num_attention_heads,
+                self.model_config.num_key_value_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+        else:
+            raise ValueError(f"Unsupported attention backend: {backend}")
 
     def init_memory_pool(self):
         """Initialize memory pool for KV cache."""
@@ -245,6 +274,7 @@ class AudioBackboneModelRunner(BaseModelRunner):
             out_cache_loc=out_cache_loc,
             positions=positions,
             extend_start_loc=jnp.array([0], dtype=jnp.int32) if is_prefill else None,
+            attn_backend=self.attn_backend,
         )
 
         if self.token_to_kv_pool is None:
