@@ -164,7 +164,7 @@ class AudioBackboneScheduler:
         # We need sharding spec for creating new input arrays
         sharding = NamedSharding(self.mesh, PartitionSpec())
 
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             # Temporarily update request input_ids and cache for forward pass
             req.input_ids = current_input_ids
             
@@ -179,7 +179,7 @@ class AudioBackboneScheduler:
             next_token_scalar = jax.device_get(next_token).item()
             
             # if len(generated_ids) == 0:
-            logger.info("第%d步推理结果： token id: %s", _,next_token_scalar)
+            logger.info("第%d步推理结果： token id: %s", step,next_token_scalar)
             
             # TODO: Handle EOS token properly (need access to tokenizer config)
             # For now assume 151672 (MIMO_EOT_IDX) or 151643 (<|endoftext|>)
