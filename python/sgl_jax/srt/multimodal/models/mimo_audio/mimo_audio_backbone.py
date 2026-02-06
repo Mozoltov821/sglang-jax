@@ -673,7 +673,7 @@ class MiMoAudioForCausalLM(nnx.Module):
 
         # Forward through main transformer
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            inputs_embeds_flat, forward_batch, token_to_kv_pool
+            inputs_embeds_flat, forward_batch.positions, forward_batch, token_to_kv_pool
         )
         
         # Get logits for the last positions using LogitsProcessor
