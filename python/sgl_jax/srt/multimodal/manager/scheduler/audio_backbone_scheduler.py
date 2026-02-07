@@ -200,11 +200,16 @@ class AudioBackboneScheduler:
             next_token_logits = text_logits_output.next_token_logits
             logits_np = np.array(jax.device_get(next_token_logits))
 
-            # Force text generation by masking out the empty token
             # Remove seq_len dim if present [B, 1, V] -> [B, V]
             if logits_np.ndim == 3:
                 logits_np = logits_np[:, -1, :]
 
+            # Force text generation by masking out audio control tokens
+            # These tokens should not be generated in ASR text output
+            logits_np[:, MIMO_EMPTY_IDX] = -float('inf')    # <|empty|>
+            logits_np[:, MIMO_SOSP_IDX] = -float('inf')     # <|sosp|>
+            logits_np[:, MIMO_EOSP_IDX] = -float('inf')     # <|eosp|>
+            logits_np[:, MIMO_SOSTM_IDX] = -float('inf')    # <|sostm|>
 
             # Sample token (NumPy implementation)
             # logits_np shape is [B, vocab_size]
