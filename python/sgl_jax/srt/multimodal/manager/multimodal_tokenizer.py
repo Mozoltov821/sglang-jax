@@ -870,7 +870,8 @@ class MultimodalTokenizer(TokenizerManager):
             # prefix: <|im_start|>user\n
             # suffix: {prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n
             prefix_text = "<|im_start|>user\n"
-            suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
+            suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n"
+            # suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
 
             try:
                 prefix_ids = self.tokenizer(prefix_text)["input_ids"]
