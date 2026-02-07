@@ -846,10 +846,11 @@ class MultimodalTokenizer(TokenizerManager):
                                     logger.warning("Failed to download audio from URL: %s", e)
 
         # 2. Construct Prompt Segments (Manual construction for precise Audio placement)
-        # Official format: <|im_start|>user\n [AUDIO] {prompt} <|im_end|>\n<|im_start|>assistant\n
+        # Format for audio understanding/ASR: <|im_start|>user\n{prompt}[AUDIO]<|im_end|>\n<|im_start|>assistant\n
+        # Instruction comes BEFORE audio so model knows what to do with the audio
 
-        prefix_text = "<|im_start|>user\n"
-        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n"
+        prefix_text = f"<|im_start|>user\n{prompt_text.strip()}"
+        suffix_text = "<|im_end|>\n<|im_start|>assistant\n"
         
         prefix_ids = []
         suffix_ids = []
