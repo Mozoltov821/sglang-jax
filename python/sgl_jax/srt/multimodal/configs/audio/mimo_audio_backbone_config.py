@@ -117,16 +117,16 @@ class MiMoAudioBackboneConfig(PretrainedConfig):
 class MiMoAudioArguments:
     """Arguments for MiMo Audio model inference.
 
-    Token indices should be loaded from the model's config at runtime.
+    Token indices use MiMo Audio's special tokens from the tokenizer vocab.
     """
 
     model_name_or_path: Optional[str] = None
-    sosp_idx: int = 0  # start of speech token index
-    eosp_idx: int = 0  # end of speech token index
-    sostm_idx: int = 0  # start of streaming token index
-    eostm_idx: int = 0  # end of streaming token index
-    eot_idx: int = 0  # end of turn token index
-    empty_idx: int = 0  # empty token index
+    sosp_idx: int = 151665   # <|sosp|> - start of speech token
+    eosp_idx: int = 151666   # <|eosp|> - end of speech token
+    sostm_idx: int = 151670  # <|sostm|> - start of streaming token
+    eostm_idx: int = 151671  # <|eostm|> - end of streaming token
+    eot_idx: int = 151672    # <|eot|> - end of turn token
+    empty_idx: int = 151667  # <|empty|> - empty/audio placeholder token
 
 
 @dataclass

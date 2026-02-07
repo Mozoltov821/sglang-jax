@@ -108,14 +108,17 @@ class AudioBackboneModelRunner(BaseModelRunner):
         self.model_config.model_class = self.model_class
 
         # Create audio arguments from HF config
+        # Default values match MiMo Audio tokenizer special tokens:
+        # <|sosp|>: 151665, <|eosp|>: 151666, <|empty|>: 151667
+        # <|sostm|>: 151670, <|eostm|>: 151671, <|eot|>: 151672
         self.audio_args = MiMoAudioArguments(
             model_name_or_path=self.server_args.model_path,
-            sosp_idx=hf_config.get("sosp_idx", 0),
-            eosp_idx=hf_config.get("eosp_idx", 0),
-            sostm_idx=hf_config.get("sostm_idx", 0),
-            eostm_idx=hf_config.get("eostm_idx", 0),
-            eot_idx=hf_config.get("eot_idx", 0),
-            empty_idx=hf_config.get("empty_idx", 0),
+            sosp_idx=hf_config.get("sosp_idx", 151665),
+            eosp_idx=hf_config.get("eosp_idx", 151666),
+            sostm_idx=hf_config.get("sostm_idx", 151670),
+            eostm_idx=hf_config.get("eostm_idx", 151671),
+            eot_idx=hf_config.get("eot_idx", 151672),
+            empty_idx=hf_config.get("empty_idx", 151667),
         )
 
         self.model = self.model_loader.load_model(

@@ -717,11 +717,11 @@ class MultimodalTokenizer(TokenizerManager):
         prefix_ids = None
         suffix_ids = None
         if obj.prompt and self.tokenizer is not None:
-            # Construct the correct format: [prefix] + [audio] + [suffix]
+            # Official MiMo format: [prefix] + [audio] + [suffix]
             # prefix: <|im_start|>user\n
-            # suffix: {prompt}<|im_end|>\n<|im_start|>assistant\n
+            # suffix: {prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n
             prefix_text = "<|im_start|>user\n"
-            suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n"
+            suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
 
             try:
                 prefix_ids = self.tokenizer(prefix_text)["input_ids"]
@@ -846,11 +846,11 @@ class MultimodalTokenizer(TokenizerManager):
                                     logger.warning("Failed to download audio from URL: %s", e)
 
         # 2. Construct Prompt Segments (Manual construction for precise Audio placement)
-        # Format for audio understanding/ASR: <|im_start|>user\n{prompt}[AUDIO]<|im_end|>\n<|im_start|>assistant\n
-        # Instruction comes BEFORE audio so model knows what to do with the audio
+        # Official MiMo format: <|im_start|>user\n[AUDIO]{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n
+        # Audio comes FIRST, then instruction/question
 
-        prefix_text = f"<|im_start|>user\n{prompt_text.strip()}"
-        suffix_text = "<|im_end|>\n<|im_start|>assistant\n"
+        prefix_text = "<|im_start|>user\n"
+        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
         
         prefix_ids = []
         suffix_ids = []
