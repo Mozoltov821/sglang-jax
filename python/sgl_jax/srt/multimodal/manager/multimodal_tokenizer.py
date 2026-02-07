@@ -737,9 +737,15 @@ class MultimodalTokenizer(TokenizerManager):
     def _load_audio_from_bytes(self, audio_bytes: bytes, target_sr: int = 24000) -> np.ndarray:
         """Load audio from bytes (wav, mp3, etc.) and resample to target_sr.
 
-        Uses librosa for loading and resampling.
+        Uses soundfile for loading and torchaudio for resampling to match
+        the official MiMo Audio implementation.
+
+        Note: librosa.load produces different resampling results that cause
+        ~2.5% of mel spectrogram values to hit the floor, affecting ASR accuracy.
         """
-        import librosa
+        import soundfile as sf
+        import torch
+        import torchaudio
 
         # Check if it's a valid audio file format
         if audio_bytes[:4] == b'RIFF':
@@ -753,15 +759,31 @@ class MultimodalTokenizer(TokenizerManager):
         else:
             logger.warning("Unknown audio format, first 4 bytes: %s", audio_bytes[:4].hex())
 
+        # Load audio with soundfile (returns numpy array)
         with io.BytesIO(audio_bytes) as f:
-            audio_array, orig_sr = librosa.load(f, sr=target_sr, mono=True)
+            audio_array, orig_sr = sf.read(f)
 
-        logger.debug("librosa.load: orig_sr=%s, target_sr=%d, samples=%d",
+        # Convert to torch tensor for resampling
+        audio_tensor = torch.from_numpy(audio_array).float()
+
+        # Handle stereo -> mono (average channels like official impl)
+        if audio_tensor.ndim == 2:
+            audio_tensor = audio_tensor.mean(dim=1)
+
+        # Resample using torchaudio (matches official MiMo implementation)
+        if orig_sr != target_sr:
+            audio_tensor = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
+            logger.debug("Resampled audio from %d Hz to %d Hz", orig_sr, target_sr)
+
+        audio_array = audio_tensor.numpy()
+        logger.debug("Audio loaded: orig_sr=%d, target_sr=%d, samples=%d",
                      orig_sr, target_sr, len(audio_array))
         return audio_array
 
     def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """Resample audio to target sample rate using librosa.
+        """Resample audio to target sample rate using torchaudio.
+
+        Uses torchaudio.functional.resample to match official MiMo implementation.
 
         Args:
             audio: Input audio array.
@@ -774,12 +796,14 @@ class MultimodalTokenizer(TokenizerManager):
         if orig_sr == target_sr:
             return audio
 
-        import librosa
+        import torch
+        import torchaudio
 
-        resampled = librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
+        audio_tensor = torch.from_numpy(audio).float()
+        resampled = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
         logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
                     orig_sr, target_sr, len(audio), len(resampled))
-        return resampled.astype(np.float32)
+        return resampled.numpy().astype(np.float32)
 
     async def asr(
         self,
