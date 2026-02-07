@@ -98,6 +98,7 @@ class AudioBackboneModelWorker:
             req_pool_indices=jnp.array(req_pool_indices),
             seq_lens=jnp.array(seq_lens_arr),
             out_cache_loc=jnp.array(out_cache_loc),
+            cache_loc=jnp.array(out_cache_loc),  # Same as out_cache_loc for simple case
             extend_start_loc=extend_start_loc,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,

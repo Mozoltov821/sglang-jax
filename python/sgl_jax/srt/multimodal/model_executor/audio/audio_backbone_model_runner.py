@@ -127,29 +127,21 @@ class AudioBackboneModelRunner(BaseModelRunner):
         self.kv_cache_dtype = jnp.bfloat16
 
     def init_attention_backend(self):
-        """Initialize attention backend."""
+        """Initialize attention backend.
+
+        Note: For audio backbone, we force native attention because FlashAttention
+        requires additional metadata (cu_q_lens, cu_kv_lens, distribution, etc.)
+        that are computed by the standard scheduler flow.
+        """
         num_attn_heads = self.model_config.num_attention_heads
         num_kv_heads = self.model_config.num_key_value_heads
 
-        backend = getattr(self.server_args, 'attention_backend', 'native')
-        if self.server_args.device == "cpu" and backend == "fa":
-            logger.warning("FlashAttention not supported on CPU; falling back to native.")
-            backend = "native"
-
-        if backend == "native":
-            from sgl_jax.srt.layers.attention.native_backend import NativeAttention
-            self.attn_backend = NativeAttention(num_attn_heads, num_kv_heads, self.mesh)
-        elif backend == "fa":
-            from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
-            self.attn_backend = FlashAttention(
-                num_attn_heads,
-                num_kv_heads,
-                self.model_config.head_dim,
-                page_size=self.page_size,
-                mesh=self.mesh,
-            )
-        else:
-            raise ValueError(f"Unsupported attention backend: {backend}")
+        # Force native attention for audio backbone
+        # FlashAttention requires forward_metadata with cu_q_lens, cu_kv_lens, etc.
+        # which are computed in the standard scheduler flow
+        from sgl_jax.srt.layers.attention.native_backend import NativeAttention
+        self.attn_backend = NativeAttention(num_attn_heads, num_kv_heads, self.mesh)
+        logger.info("AudioBackboneModelRunner using NativeAttention backend")
 
     def init_memory_pool(self):
         """Initialize KV cache memory pool."""
