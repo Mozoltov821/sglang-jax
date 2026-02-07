@@ -109,17 +109,16 @@ class AudioBackboneModelWorker:
             LogitsMetadata for LogitsProcessor
         """
         if is_prefill:
-            # For prefill, we want logits at the last position of each sequence
             return LogitsMetadata(
                 forward_mode=ForwardMode.EXTEND,
+                extend_seq_lens=jnp.array([seq_len] * batch_size, dtype=jnp.int32),
+                extend_seq_lens_cpu=[seq_len] * batch_size,
                 top_logprobs_nums=[0] * batch_size,
-                return_logprob=False,
             )
         else:
             return LogitsMetadata(
                 forward_mode=ForwardMode.DECODE,
                 top_logprobs_nums=[0] * batch_size,
-                return_logprob=False,
             )
 
     def forward(
