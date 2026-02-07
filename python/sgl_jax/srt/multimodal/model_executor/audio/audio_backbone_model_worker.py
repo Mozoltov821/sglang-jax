@@ -5,7 +5,10 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import MiMoSamplerConfig
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.audio.audio_backbone_model_runner import (
@@ -26,6 +29,92 @@ class AudioBackboneModelWorker:
         self.mesh = mesh
         self.model_runner = AudioBackboneModelRunner(server_args, mesh, model_class=model_class)
 
+    def _create_forward_batch(
+        self,
+        input_ids: jax.Array,
+        seq_lens: np.ndarray,
+        is_prefill: bool = True,
+    ) -> ForwardBatch:
+        """Create ForwardBatch for RadixAttention.
+
+        Args:
+            input_ids: [B, channels, seq_len]
+            seq_lens: Sequence lengths for each request
+            is_prefill: Whether this is prefill or decode phase
+
+        Returns:
+            ForwardBatch with positions and metadata for RadixAttention
+        """
+        B, _, seq_len = input_ids.shape
+        T_groups = seq_len // MIMO_GROUP_SIZE  # Number of groups (positions for main transformer)
+
+        # For MiMo, positions are based on T_groups, not seq_len
+        if is_prefill:
+            # Prefill: positions for all groups
+            positions = jnp.arange(T_groups, dtype=jnp.int32)
+            forward_mode = ForwardMode.EXTEND
+        else:
+            # Decode: single position
+            positions = jnp.array([T_groups - 1], dtype=jnp.int32)
+            forward_mode = ForwardMode.DECODE
+
+        # Create req_pool_indices - allocate from req_to_token_pool
+        req_pool_indices = np.arange(B, dtype=np.int32)
+
+        # Create seq_lens based on T_groups
+        seq_lens_arr = np.array([T_groups] * B, dtype=np.int32)
+
+        # Calculate prefix lens (0 for first request)
+        prefix_lens = np.zeros(B, dtype=np.int32)
+
+        # Allocate KV cache slots
+        total_tokens = T_groups * B
+        out_cache_loc = self.model_runner.token_to_kv_pool_allocator.alloc(total_tokens)
+        if out_cache_loc is None:
+            raise RuntimeError("Failed to allocate KV cache slots")
+
+        return ForwardBatch(
+            forward_mode=forward_mode,
+            batch_size=B,
+            input_ids=None,  # We pass input_ids separately
+            positions=positions,
+            req_pool_indices=jnp.array(req_pool_indices),
+            seq_lens=jnp.array(seq_lens_arr),
+            prefix_lens=jnp.array(prefix_lens),
+            out_cache_loc=jnp.array(out_cache_loc),
+            total_num_tokens=total_tokens,
+        )
+
+    def _create_logits_metadata(
+        self,
+        batch_size: int,
+        seq_len: int,
+        is_prefill: bool = True,
+    ) -> LogitsMetadata:
+        """Create LogitsMetadata for logits processing.
+
+        Args:
+            batch_size: Number of requests in batch
+            seq_len: Sequence length (T_groups for MiMo)
+            is_prefill: Whether this is prefill or decode phase
+
+        Returns:
+            LogitsMetadata for LogitsProcessor
+        """
+        if is_prefill:
+            # For prefill, we want logits at the last position of each sequence
+            return LogitsMetadata(
+                forward_mode=ForwardMode.EXTEND,
+                top_logprobs_nums=[0] * batch_size,
+                return_logprob=False,
+            )
+        else:
+            return LogitsMetadata(
+                forward_mode=ForwardMode.DECODE,
+                top_logprobs_nums=[0] * batch_size,
+                return_logprob=False,
+            )
+
     def forward(
         self,
         batch: Req,
@@ -39,7 +128,7 @@ class AudioBackboneModelWorker:
 
         Args:
             batch: Request batch containing pre-aggregated input_ids
-            cache: Optional KV cache
+            cache: Optional KV cache (unused, for interface compatibility)
 
         Returns:
             (text_logits, local_hidden_states, cache), cache_miss_count
@@ -79,7 +168,18 @@ class AudioBackboneModelWorker:
                 input_ids.shape[2],
             )
 
-        return self.model_runner.forward(input_ids, cache, **kwargs)
+        B, _, padded_seq_len = input_ids.shape
+        T_groups = padded_seq_len // MIMO_GROUP_SIZE
+
+        # Check if positions are provided (for decode steps)
+        positions = kwargs.get("positions", None)
+        is_prefill = positions is None
+
+        # Create ForwardBatch and LogitsMetadata
+        forward_batch = self._create_forward_batch(input_ids, None, is_prefill)
+        logits_metadata = self._create_logits_metadata(B, T_groups, is_prefill)
+
+        return self.model_runner.forward(input_ids, forward_batch, logits_metadata, **kwargs)
 
     def patch_decode(
         self,
@@ -98,4 +198,3 @@ class AudioBackboneModelWorker:
             local_tokens: [B, group_size, audio_channels], cache_miss_count
         """
         return self.model_runner.patch_decode(local_embeds, key, sampler_config)
-

@@ -1,7 +1,6 @@
 """Audio Backbone Model Runner for MiMo Audio.
 
-Simplified version without RadixAttention/KV cache pool to avoid mesh context issues.
-Uses standard attention (Branch 2 in MiMoAudioAttention) instead.
+Uses RadixAttention with proper mesh context handling.
 """
 
 import json
@@ -15,9 +14,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
@@ -33,8 +38,8 @@ logger = logging.getLogger(__name__)
 class AudioBackboneModelRunner(BaseModelRunner):
     """Model runner for MiMo Audio Backbone (LLM with audio generation).
 
-    Uses simple attention without RadixAttention/KV cache pool to avoid
-    mesh context issues with shard_map operations.
+    Uses RadixAttention with proper mesh context handling following
+    the pattern from standard ModelRunner.
     """
 
     def __init__(
@@ -53,10 +58,14 @@ class AudioBackboneModelRunner(BaseModelRunner):
         )
         self.model_class = model_class
         self.server_args = server_args
+        self.page_size = server_args.page_size if server_args else 1
+        self.tp_size = server_args.tp_size if server_args else 1
         self.initialize()
 
     def initialize(self):
         self.load_model()
+        self.init_attention_backend()
+        self.init_memory_pool()
         self.initialize_jit()
 
     def _load_hf_config(self, model_path: str) -> dict:
@@ -113,13 +122,75 @@ class AudioBackboneModelRunner(BaseModelRunner):
             model_config=self.model_config,
         )
 
+        # Parse model config
+        self.dtype = self.model_config.dtype if hasattr(self.model_config, 'dtype') else jnp.bfloat16
+        self.kv_cache_dtype = jnp.bfloat16
+
+    def init_attention_backend(self):
+        """Initialize attention backend."""
+        num_attn_heads = self.model_config.num_attention_heads
+        num_kv_heads = self.model_config.num_key_value_heads
+
+        backend = getattr(self.server_args, 'attention_backend', 'native')
+        if self.server_args.device == "cpu" and backend == "fa":
+            logger.warning("FlashAttention not supported on CPU; falling back to native.")
+            backend = "native"
+
+        if backend == "native":
+            from sgl_jax.srt.layers.attention.native_backend import NativeAttention
+            self.attn_backend = NativeAttention(num_attn_heads, num_kv_heads, self.mesh)
+        elif backend == "fa":
+            from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+            self.attn_backend = FlashAttention(
+                num_attn_heads,
+                num_kv_heads,
+                self.model_config.head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+            )
+        else:
+            raise ValueError(f"Unsupported attention backend: {backend}")
+
+    def init_memory_pool(self):
+        """Initialize KV cache memory pool."""
+        # Calculate max tokens based on available memory
+        max_total_num_tokens = 8192  # Default value for audio backbone
+        max_num_reqs = 16
+
+        self.max_total_num_tokens = max_total_num_tokens
+
+        # Create request to token pool
+        self.req_to_token_pool = ReqToTokenPool(
+            size=max_num_reqs + 1,
+            max_context_len=self.model_config.max_position_embeddings + 4,
+            dtype=np.int32,
+        )
+
+        # Create KV cache pool
+        head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
+        self.token_to_kv_pool = MHATokenToKVPool(
+            size=self.max_total_num_tokens,
+            page_size=self.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.num_key_value_heads,
+            head_dim=head_dim_aligned,
+            layer_num=self.model_config.num_hidden_layers,
+            mesh=self.mesh,
+        )
+
+        # Create allocator
+        self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+            size=self.max_total_num_tokens,
+            kvcache=self.token_to_kv_pool,
+        )
+
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
-        # Simple JIT without mesh context (no shard_map operations)
         @partial(
             jax.jit,
+            donate_argnames=["token_to_kv_pool"],
             static_argnames=["model_state_def"],
         )
         def forward(
@@ -127,11 +198,13 @@ class AudioBackboneModelRunner(BaseModelRunner):
             model_state_def,
             model_state_leaves,
             input_ids,
-            positions,
+            forward_batch,
+            token_to_kv_pool,
+            logits_metadata,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
-            return model.forward_simple(input_ids, positions)
+            return model.forward(input_ids, forward_batch, token_to_kv_pool, logits_metadata)
 
         @partial(
             jax.jit,
@@ -153,14 +226,18 @@ class AudioBackboneModelRunner(BaseModelRunner):
 
         def forward_wrapper(
             input_ids: jax.Array,
-            positions: jax.Array,
+            forward_batch: ForwardBatch,
+            logits_metadata: LogitsMetadata,
         ):
+            token_to_kv_pool = self.token_to_kv_pool
             return forward(
                 model_def,
                 model_state_def,
                 model_state_leaves,
                 input_ids,
-                positions,
+                forward_batch,
+                token_to_kv_pool,
+                logits_metadata,
             )
 
         def patch_decode_wrapper(
@@ -183,40 +260,65 @@ class AudioBackboneModelRunner(BaseModelRunner):
         self.jitted_forward = forward_wrapper
         self.jitted_patch_decode = patch_decode_wrapper
 
+    def _get_mesh_context(self):
+        """Get mesh context manager for JAX operations.
+
+        Following the pattern from standard ModelRunner._forward_raw.
+        """
+        try:
+            return jax.sharding.use_mesh(self.mesh)
+        except AttributeError:
+            try:
+                return jax.set_mesh(self.mesh)
+            except AttributeError:
+                return self.mesh
+
     def forward(
         self,
         input_ids: jax.Array,
-        cache: Optional[list] = None,
+        forward_batch: ForwardBatch,
+        logits_metadata: LogitsMetadata,
         **kwargs,
     ):
-        """Forward pass through main transformer using simple attention.
+        """Forward pass through main transformer using RadixAttention.
 
         Args:
             input_ids: [B, 1 + audio_channels, seq_len]
-            cache: Unused (legacy)
-            kwargs: Must contain 'positions'
+            forward_batch: Batch metadata for RadixAttention
+            logits_metadata: Metadata for logits processing
 
         Returns:
-            (text_logits, local_hidden_states, None), cache_miss_count
+            (text_logits, local_hidden_states, None, layers_kv_fused, layers_callback_flag), cache_miss_count
         """
         cache_miss_count = 0
-        positions = kwargs.get("positions", None)
-
-        # Infer positions if not provided (Prefill)
-        if positions is None:
-            B, _, L = input_ids.shape
-            # For MiMo, L is seq_len, T_groups = L // group_size
-            T_groups = L // 4  # group_size = 4
-            positions = jnp.arange(T_groups, dtype=jnp.int32)
-
         import jax._src.test_util as jtu
 
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            # output is (text_logits, local_hidden_states)
-            text_logits, local_hidden_states = self.jitted_forward(input_ids, positions)
-            cache_miss_count = count()
+        # Use mesh context for RadixAttention operations
+        with self._get_mesh_context():
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                result = self.jitted_forward(input_ids, forward_batch, logits_metadata)
+                cache_miss_count = count()
 
-        return (text_logits, local_hidden_states, None), cache_miss_count
+            # Handle KV cache update after forward
+            if len(result) == 5:
+                text_logits, local_hidden_states, cache, layers_kv_fused, layers_callback_flag = result
+                self._set_kv_cache_after_forward(layers_kv_fused)
+                return (text_logits, local_hidden_states, cache), cache_miss_count
+            else:
+                return result, cache_miss_count
+
+    def _set_kv_cache_after_forward(self, layers_kv_fused):
+        """Update KV cache after forward pass."""
+        if self.tp_size == 1:
+            target_sharding = NamedSharding(
+                self.token_to_kv_pool.mesh,
+                P(None, self.token_to_kv_pool.kv_partition_axis, None),
+            )
+            layers_kv_fused = [
+                jax.device_put(layer_kv_fused, target_sharding)
+                for layer_kv_fused in layers_kv_fused
+            ]
+        self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
 
     def patch_decode(
         self,
@@ -237,7 +339,10 @@ class AudioBackboneModelRunner(BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            output = self.jitted_patch_decode(local_embeds, key, sampler_config)
-            cache_miss_count = count()
+        # Use mesh context for operations
+        with self._get_mesh_context():
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                output = self.jitted_patch_decode(local_embeds, key, sampler_config)
+                cache_miss_count = count()
+
         return output, cache_miss_count
