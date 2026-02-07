@@ -164,7 +164,10 @@ class AudioBackboneScheduler:
         """Autoregressive text generation for ASR mode."""
         max_new_tokens = getattr(req, "max_new_tokens", 256)
         generated_ids = []
-        
+
+        # Reset KV cache state for this new request
+        self.backbone_worker.reset_cache_state(req.rid)
+
         current_input_ids = req.input_ids
         current_pos = 0
 
@@ -198,8 +201,14 @@ class AudioBackboneScheduler:
             logits_np = np.array(jax.device_get(next_token_logits))
 
             # Force text generation by masking out the empty token
-            # logits_np shape is [B, vocab_size], not [B, seq_len, vocab_size]
+            # Remove seq_len dim if present [B, 1, V] -> [B, V]
+            if logits_np.ndim == 3:
+                logits_np = logits_np[:, -1, :]
+
+            # Force text generation by masking out audio control tokens
             logits_np[:, MIMO_EMPTY_IDX] = -float('inf')
+            logits_np[:, MIMO_SOSP_IDX] = -float('inf')
+            logits_np[:, MIMO_EOSP_IDX] = -float('inf')
 
             # Sample token (NumPy implementation)
             # logits_np shape is [B, vocab_size]
@@ -242,10 +251,13 @@ class AudioBackboneScheduler:
         # Use numpy array to avoid JAX initialization in detokenizer process
         req.generated_text_tokens = np.array(generated_ids, dtype=np.int32)
         logger.info("ASR generated %d tokens for rid=%s", len(generated_ids), req.rid)
-        
+
         # Clear inputs and cache to free memory and avoid JAX arrays in pickle
         req.input_ids = None
         req.backbone_cache = None
+
+        # Clean up KV cache state for this request
+        self.backbone_worker.reset_cache_state(req.rid)
 
     def _build_next_step_input(self, token_id: int, audio_tokens: Optional[np.ndarray] = None) -> jax.Array:
         """Build input_ids for a single text token step [1, 9, group_size]."""
