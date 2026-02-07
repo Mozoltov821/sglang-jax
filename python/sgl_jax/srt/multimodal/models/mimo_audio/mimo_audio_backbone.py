@@ -395,11 +395,12 @@ class MiMoAudioTransformer(nnx.Module):
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
-        hidden_states = self.norm(hidden_states)
-        
+
         if residual is not None:
             hidden_states += residual
-            
+        hidden_states = self.norm(hidden_states)
+
+
         return hidden_states, layers_kv_fused, layers_callback_flag
 
 
