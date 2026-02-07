@@ -522,8 +522,9 @@ class Req:
 
         token_id = int(self.generated_text_tokens[0])
 
-        # Text row: [token, -100, -100, -100]
-        text_row = [token_id] + [MIMO_TEXT_PADDING] * (MIMO_AUDIO_GROUP_SIZE - 1)
+        # Text row: [token, token, token, token] - repeat token across all 4 timesteps
+        # This matches official MiMo implementation where next_text_tokens.expand(-1, group_size, -1)
+        text_row = [token_id] * MIMO_AUDIO_GROUP_SIZE
         text_row = jnp.array(text_row, dtype=jnp.int32)
 
         rows = [text_row]
