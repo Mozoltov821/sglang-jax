@@ -53,19 +53,23 @@ class AudioBackboneModelWorker:
             # Prefill: positions for all groups
             positions = jnp.arange(T_groups, dtype=jnp.int32)
             forward_mode = ForwardMode.EXTEND
+            # For extend mode, we need extend_start_loc and extend_seq_lens
+            extend_start_loc = jnp.array([0], dtype=jnp.int32)
+            extend_seq_lens = jnp.array([T_groups] * B, dtype=jnp.int32)
+            extend_prefix_lens = jnp.zeros(B, dtype=jnp.int32)
         else:
             # Decode: single position
             positions = jnp.array([T_groups - 1], dtype=jnp.int32)
             forward_mode = ForwardMode.DECODE
+            extend_start_loc = None
+            extend_seq_lens = None
+            extend_prefix_lens = None
 
         # Create req_pool_indices - allocate from req_to_token_pool
         req_pool_indices = np.arange(B, dtype=np.int32)
 
         # Create seq_lens based on T_groups
         seq_lens_arr = np.array([T_groups] * B, dtype=np.int32)
-
-        # Calculate prefix lens (0 for first request)
-        prefix_lens = np.zeros(B, dtype=np.int32)
 
         # Allocate KV cache slots
         total_tokens = T_groups * B
@@ -74,15 +78,18 @@ class AudioBackboneModelWorker:
             raise RuntimeError("Failed to allocate KV cache slots")
 
         return ForwardBatch(
+            bid=0,  # Batch id
             forward_mode=forward_mode,
             batch_size=B,
-            input_ids=None,  # We pass input_ids separately
+            input_ids=None,  # We pass input_ids separately to model
             positions=positions,
             req_pool_indices=jnp.array(req_pool_indices),
             seq_lens=jnp.array(seq_lens_arr),
-            prefix_lens=jnp.array(prefix_lens),
             out_cache_loc=jnp.array(out_cache_loc),
-            total_num_tokens=total_tokens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            attn_backend=self.model_runner.attn_backend,
         )
 
     def _create_logits_metadata(
