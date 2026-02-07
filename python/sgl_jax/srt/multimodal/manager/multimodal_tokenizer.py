@@ -110,10 +110,10 @@ class MultimodalTokenizer(TokenizerManager):
             logger.warning("Failed to load image processor from %s", model_path)
 
     def _init_audio_processor(self, model_path: str):
-        """Initialize audio processor for audio models using transformers FeatureExtractor.
+        """Initialize audio processor for audio models using transformers audio_utils.
 
-        This loads the audio config and initializes a WhisperFeatureExtractor-like processor
-        that uses numpy (not JAX) for mel spectrogram computation.
+        This loads the audio config and initializes mel filter bank and window function
+        that match the official MiMo Audio implementation (power=1.0, log_mel="log").
         """
         import json
         import os
@@ -161,18 +161,46 @@ class MultimodalTokenizer(TokenizerManager):
 
                 if "n_mels" in config and "sampling_rate" in config:
                     self.audio_config = config
-                    # Use transformers WhisperFeatureExtractor (numpy-based, no JAX dependency)
-                    from transformers import WhisperFeatureExtractor
+                    # Use transformers audio_utils (no torch dependency, matches official MiMo)
+                    from transformers.audio_utils import mel_filter_bank, window_function
 
-                    self.audio_processor = WhisperFeatureExtractor(
-                        feature_size=config.get("n_mels", 128),
-                        sampling_rate=config.get("sampling_rate", 24000),
-                        hop_length=config.get("hop_length", 240),
-                        n_fft=config.get("nfft", 960),
-                        padding_value=0.0,
-                        return_attention_mask=False,
+                    # Get parameters from config (with MiMo Audio defaults)
+                    sample_rate = config.get("sampling_rate", 24000)
+                    n_fft = config.get("nfft", 960)
+                    hop_length = config.get("hop_length", 240)
+                    win_length = config.get("window_size", 960)
+                    f_min = config.get("fmin", 0)
+                    f_max = config.get("fmax", sample_rate // 2)  # Default to Nyquist
+                    n_mels = config.get("n_mels", 128)
+
+                    # Create mel filter bank
+                    self.mel_filters = mel_filter_bank(
+                        num_frequency_bins=n_fft // 2 + 1,
+                        num_mel_filters=n_mels,
+                        min_frequency=f_min,
+                        max_frequency=f_max,
+                        sampling_rate=sample_rate,
+                        norm="slaney",
+                        mel_scale="slaney",
                     )
-                    logger.warning("Initialized WhisperFeatureExtractor from %s", try_path)
+
+                    # Create window function
+                    self.window = window_function(win_length, "hann")
+
+                    # Store parameters for spectrogram computation
+                    self.mel_params = {
+                        "sample_rate": sample_rate,
+                        "n_fft": n_fft,
+                        "hop_length": hop_length,
+                        "win_length": win_length,
+                    }
+
+                    # Store sampling rate for resampling
+                    self.audio_processor = type('AudioProcessor', (), {'sampling_rate': sample_rate})()
+                    logger.warning(
+                        "Initialized transformers audio_utils from %s: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
+                        try_path, sample_rate, n_fft, hop_length, n_mels
+                    )
                     return
             except Exception as e:
                 logger.warning("Failed to init audio processor from %s: %s", try_path, e)
@@ -182,49 +210,56 @@ class MultimodalTokenizer(TokenizerManager):
         logger.warning("Could not initialize audio processor")
 
     def _preprocess_audio_to_mel(self, audio_array: np.ndarray, input_sr: int = None) -> tuple:
-        """Convert raw audio waveform to mel spectrogram using WhisperFeatureExtractor.
+        """Convert raw audio waveform to mel spectrogram using transformers audio_utils.
+
+        This matches the official MiMo Audio implementation:
+        - Uses power=1.0 (amplitude spectrogram)
+        - Applies natural log via log_mel="log"
+        - Returns mel spectrogram in [batch, time, n_mels] format
 
         Args:
             audio_array: Raw audio waveform as numpy array, shape (samples,).
-            input_sr: Input audio sample rate. If different from processor's rate, will resample.
+            input_sr: Input audio sample rate. If different from target rate, will resample.
 
         Returns:
             Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
             mel_spectrogram shape: [batch, time, n_mels]
         """
-        if self.audio_processor is None:
-            raise ValueError("Audio processor not initialized. Cannot preprocess audio.")
+        from transformers.audio_utils import spectrogram
 
-        # WhisperFeatureExtractor expects 1D array or list of 1D arrays
+        if not hasattr(self, 'mel_filters') or self.mel_filters is None:
+            raise ValueError("Mel filter bank not initialized. Cannot preprocess audio.")
+
+        # Ensure 1D array
         if audio_array.ndim == 2:
             audio_array = audio_array.squeeze(0)
 
-        # Resample if input sample rate differs from processor's expected rate
+        # Resample if input sample rate differs from target rate
         target_sr = self.audio_processor.sampling_rate
         if input_sr is not None and input_sr != target_sr:
             audio_array = self._resample_audio(audio_array, input_sr, target_sr)
 
-        # Extract mel features using WhisperFeatureExtractor
-        # IMPORTANT: Set padding=False to prevent automatic padding to 30 seconds
-        # Returns dict with 'input_features' key, shape [batch, n_mels, time]
-        features = self.audio_processor(
-            audio_array,
-            sampling_rate=self.audio_processor.sampling_rate,
-            return_tensors="np",
-            padding=False,  # Do not pad to fixed length
+        # Compute mel spectrogram with power=1.0 (matches official MiMo)
+        # spectrogram() returns [n_mels, time] with log_mel applied
+        mels = spectrogram(
+            waveform=audio_array,
+            window=self.window,
+            frame_length=self.mel_params["n_fft"],
+            hop_length=self.mel_params["hop_length"],
+            fft_length=self.mel_params["n_fft"],
+            power=1.0,  # Amplitude spectrogram (matches official MiMo)
+            center=True,
+            mel_filters=self.mel_filters,
+            log_mel="log",  # Natural logarithm (matches official torch.log)
+            mel_floor=1e-7,  # Matches official torch.clip(spec, min=1e-7)
         )
-        mels = features["input_features"]  # shape: [batch, n_mels, time]
 
-        # Whisper uses log10. MiMo uses natural log (ln).
-        # Convert log10(x) -> ln(x) by multiplying by ln(10)
-        mels = mels * np.log(10.0)
-
-        # Transpose to [batch, time, n_mels] - stay in numpy, no JAX
-        mels = np.transpose(mels, (0, 2, 1))  # [batch, time, n_mels]
+        # mels is [n_mels, time], transpose to [1, time, n_mels] for model input
+        mels = mels.T[None, :, :]  # [1, time, n_mels]
         input_lens = np.array([mels.shape[1]])
 
         logger.info(
-            "Audio preprocessing (WhisperFE + Scaling): input_samples=%d, mel_shape=%s, input_lens=%s",
+            "Audio preprocessing (transformers audio_utils): input_samples=%d, mel_shape=%s, input_lens=%s",
             len(audio_array),
             mels.shape,
             input_lens,
