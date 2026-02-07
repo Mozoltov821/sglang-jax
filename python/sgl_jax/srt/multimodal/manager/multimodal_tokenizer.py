@@ -207,7 +207,61 @@ class MultimodalTokenizer(TokenizerManager):
                 import traceback
                 logger.warning("Traceback: %s", traceback.format_exc())
 
-        logger.warning("Could not initialize audio processor")
+        # Fallback: initialize with default MiMo Audio parameters
+        logger.warning("Could not load config, using default MiMo Audio parameters")
+        self._init_default_mel_processor()
+
+    def _init_default_mel_processor(self):
+        """Initialize mel processor with default MiMo Audio parameters.
+
+        Uses the official MiMo Audio parameters:
+        - sample_rate: 24000
+        - n_fft: 960
+        - hop_length: 240
+        - win_length: 960
+        - f_min: 0
+        - f_max: 12000 (Nyquist)
+        - n_mels: 128
+        """
+        from transformers.audio_utils import mel_filter_bank, window_function
+
+        # Default MiMo Audio parameters
+        sample_rate = 24000
+        n_fft = 960
+        hop_length = 240
+        win_length = 960
+        f_min = 0
+        f_max = 12000  # Nyquist frequency
+        n_mels = 128
+
+        # Create mel filter bank
+        self.mel_filters = mel_filter_bank(
+            num_frequency_bins=n_fft // 2 + 1,
+            num_mel_filters=n_mels,
+            min_frequency=f_min,
+            max_frequency=f_max,
+            sampling_rate=sample_rate,
+            norm="slaney",
+            mel_scale="slaney",
+        )
+
+        # Create window function
+        self.window = window_function(win_length, "hann")
+
+        # Store parameters for spectrogram computation
+        self.mel_params = {
+            "sample_rate": sample_rate,
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "win_length": win_length,
+        }
+
+        # Store sampling rate for resampling
+        self.audio_processor = type('AudioProcessor', (), {'sampling_rate': sample_rate})()
+        logger.warning(
+            "Initialized transformers audio_utils with defaults: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
+            sample_rate, n_fft, hop_length, n_mels
+        )
 
     def _preprocess_audio_to_mel(self, audio_array: np.ndarray, input_sr: int = None) -> tuple:
         """Convert raw audio waveform to mel spectrogram using transformers audio_utils.
