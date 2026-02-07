@@ -205,10 +205,6 @@ class AudioBackboneScheduler:
             if logits_np.ndim == 3:
                 logits_np = logits_np[:, -1, :]
 
-            # Force text generation by masking out audio control tokens
-            logits_np[:, MIMO_EMPTY_IDX] = -float('inf')
-            logits_np[:, MIMO_SOSP_IDX] = -float('inf')
-            logits_np[:, MIMO_EOSP_IDX] = -float('inf')
 
             # Sample token (NumPy implementation)
             # logits_np shape is [B, vocab_size]
