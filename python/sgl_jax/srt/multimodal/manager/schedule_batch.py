@@ -366,12 +366,24 @@ class Req:
 
         # Concatenate all segments along sequence dimension
         input_ids = jnp.concatenate(segments, axis=1)  # [9, total_seq_len]
-        logger.info(
-            "Built backbone input: audio_mode=%s, shape=%s, rid=%s",
-            self.audio_mode,
-            input_ids.shape,
-            self.rid,
-        )
+
+        # Dump detailed backbone input structure for debugging
+        logger.info("=" * 60)
+        logger.info("Backbone Input Dump (rid=%s, audio_mode=%s):", self.rid, self.audio_mode)
+        logger.info("  prompt_input_ids: %s", self.prompt_input_ids[:20] if self.prompt_input_ids else None)
+        logger.info("  text_input_ids: %s", self.text_input_ids[:20] if self.text_input_ids else None)
+        logger.info("  audio_codes shape: %s", self.audio_codes.shape if self.audio_codes is not None else None)
+        logger.info("  Final input_ids shape: %s", input_ids.shape)
+        # Show first row (text channel) structure
+        text_channel = input_ids[0, :]
+        # Find non-padding tokens
+        non_padding_mask = text_channel != MIMO_TEXT_PADDING
+        non_padding_indices = jnp.where(non_padding_mask)[0]
+        if len(non_padding_indices) > 0:
+            sample_tokens = [(int(idx), int(text_channel[idx])) for idx in non_padding_indices[:30]]
+            logger.info("  Text channel (first 30 non-padding): %s", sample_tokens)
+        logger.info("=" * 60)
+
         return input_ids[None, :, :]  # [1, 9, total_seq_len]
 
     def _build_text_segment(self, text_ids: list) -> jax.Array:

@@ -731,7 +731,17 @@ class MultimodalTokenizer(TokenizerManager):
             try:
                 prefix_ids = self.tokenizer(prefix_text)["input_ids"]
                 suffix_ids = self.tokenizer(suffix_text)["input_ids"]
-                logger.info("ASR prefix: %r, suffix: %r", prefix_text, suffix_text)
+
+                # Dump tokenizer output for debugging
+                logger.info("=" * 60)
+                logger.info("ASR Tokenizer Output Dump:")
+                logger.info("  prefix_text: %r", prefix_text)
+                logger.info("  prefix_ids: %s", prefix_ids)
+                logger.info("  prefix decoded: %r", self.tokenizer.decode(prefix_ids))
+                logger.info("  suffix_text: %r", suffix_text)
+                logger.info("  suffix_ids: %s", suffix_ids)
+                logger.info("  suffix decoded: %r", self.tokenizer.decode(suffix_ids))
+                logger.info("=" * 60)
             except Exception as e:
                 logger.warning("Failed to tokenize ASR prompt: %s", e)
 
