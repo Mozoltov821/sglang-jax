@@ -119,7 +119,7 @@ class AudioBackboneModelWorker:
         # seq_lens is the TOTAL sequence length (including new tokens)
         seq_lens_arr = np.array([total_seq_len] * B, dtype=np.int32)
 
-        logger.debug(
+        logger.info(
             "ForwardBatch: mode=%s, positions=%s, total_seq_len=%d, new_tokens=%d, cache_locs=%d",
             forward_mode,
             positions.shape,
