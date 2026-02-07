@@ -193,6 +193,10 @@ class Req:
     generated_audio_tokens: jax.Array | None = None
     text_logits: jax.Array | None = None
 
+    # Autoregressive generation state
+    is_prefill: bool = True  # True for first forward pass, False for decode steps
+    is_finished: bool = False  # True when EOS token is generated
+
     def to_stage_reqs(self, scheduler: str):
         import logging
         logger = logging.getLogger(__name__)
@@ -491,3 +495,50 @@ class Req:
             rows.append(row)
 
         return jnp.stack(rows, axis=0)  # [9, group_size]
+
+    def build_next_step_input(self) -> jax.Array:
+        """Build input_ids for next autoregressive step based on generated tokens.
+
+        Uses generated_text_tokens and generated_audio_tokens to construct
+        the input for the next backbone forward pass.
+
+        Returns:
+            Tensor of shape [1, 9, group_size] for next step input.
+        """
+        if self.generated_text_tokens is None or len(self.generated_text_tokens) == 0:
+            raise ValueError("No generated text tokens to build next step input")
+
+        token_id = int(self.generated_text_tokens[0])
+
+        # Text row: [token, -100, -100, -100]
+        text_row = [token_id] + [MIMO_TEXT_PADDING] * (MIMO_AUDIO_GROUP_SIZE - 1)
+        text_row = jnp.array(text_row, dtype=jnp.int32)
+
+        rows = [text_row]
+
+        if self.generated_audio_tokens is not None:
+            # generated_audio_tokens: [B, group_size, audio_channels]
+            # We need [audio_channels, group_size]
+            audio_tokens = self.generated_audio_tokens
+            if hasattr(audio_tokens, "shape") and audio_tokens.ndim == 3:
+                # Take first batch item and transpose
+                audio_rows = audio_tokens[0].T.astype(jnp.int32)
+                for i in range(MIMO_AUDIO_CHANNELS):
+                    rows.append(audio_rows[i])
+            else:
+                # Fallback: fill with empty IDs
+                for ch in range(MIMO_AUDIO_CHANNELS):
+                    row = jnp.full(
+                        (MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32
+                    )
+                    rows.append(row)
+        else:
+            # No audio tokens - fill with speech empty IDs
+            for ch in range(MIMO_AUDIO_CHANNELS):
+                row = jnp.full(
+                    (MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[ch], dtype=jnp.int32
+                )
+                rows.append(row)
+
+        # Stack and add batch dim: [1, 9, group_size]
+        return jnp.stack(rows, axis=0)[None, :, :]
