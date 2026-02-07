@@ -718,32 +718,22 @@ class MultimodalTokenizer(TokenizerManager):
         mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
 
         # Tokenize the prompt (instruction)
-        text_input_ids = None
+        # Split into prefix (before audio) and suffix (after audio) like audio_understanding
+        prefix_ids = None
+        suffix_ids = None
         if obj.prompt and self.tokenizer is not None:
-            prompt_text = obj.prompt
-            # Try to apply chat template to guide the model
-            applied_template = False
-            try:
-                if hasattr(self.tokenizer, "apply_chat_template"):
-                    messages = [{"role": "user", "content": prompt_text}]
-                    formatted_prompt = self.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=True
-                    )
-                    if formatted_prompt:
-                        prompt_text = formatted_prompt
-                        applied_template = True
-                        logger.info("ASR used chat template: %r", prompt_text)
-            except Exception as e:
-                logger.warning("Failed to apply chat template for ASR: %s", e)
-            
-            # Fallback to manual ChatML construction if template failed
-            if not applied_template:
-                # Construct Qwen-style ChatML format manually
-                prompt_text = f"<|im_start|>user\n{obj.prompt}<|im_end|>\n<|im_start|>assistant\n"
-                logger.info("ASR used manual ChatML format: %r", prompt_text)
+            # Construct the correct format: [prefix] + [audio] + [suffix]
+            # prefix: <|im_start|>user\n
+            # suffix: {prompt}<|im_end|>\n<|im_start|>assistant\n
+            prefix_text = "<|im_start|>user\n"
+            suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-            encoded = self.tokenizer(prompt_text)
-            text_input_ids = encoded["input_ids"]
+            try:
+                prefix_ids = self.tokenizer(prefix_text)["input_ids"]
+                suffix_ids = self.tokenizer(suffix_text)["input_ids"]
+                logger.info("ASR prefix: %r, suffix: %r", prefix_text, suffix_text)
+            except Exception as e:
+                logger.warning("Failed to tokenize ASR prompt: %s", e)
 
         from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
@@ -754,7 +744,8 @@ class MultimodalTokenizer(TokenizerManager):
             audio_mode="asr",
             sample_rate=obj.sample_rate,
             data_type=DataType.AUDIO,
-            text_input_ids=text_input_ids,
+            text_input_ids=suffix_ids,
+            prompt_input_ids=prefix_ids,
             prompt=obj.prompt,
             n_q=8,
         )
