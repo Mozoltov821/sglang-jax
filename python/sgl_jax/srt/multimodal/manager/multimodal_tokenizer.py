@@ -181,11 +181,12 @@ class MultimodalTokenizer(TokenizerManager):
 
         logger.warning("Could not initialize audio processor")
 
-    def _preprocess_audio_to_mel(self, audio_array: np.ndarray) -> tuple:
+    def _preprocess_audio_to_mel(self, audio_array: np.ndarray, input_sr: int = None) -> tuple:
         """Convert raw audio waveform to mel spectrogram using WhisperFeatureExtractor.
-        
+
         Args:
             audio_array: Raw audio waveform as numpy array, shape (samples,).
+            input_sr: Input audio sample rate. If different from processor's rate, will resample.
 
         Returns:
             Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
@@ -197,6 +198,11 @@ class MultimodalTokenizer(TokenizerManager):
         # WhisperFeatureExtractor expects 1D array or list of 1D arrays
         if audio_array.ndim == 2:
             audio_array = audio_array.squeeze(0)
+
+        # Resample if input sample rate differs from processor's expected rate
+        target_sr = self.audio_processor.sampling_rate
+        if input_sr is not None and input_sr != target_sr:
+            audio_array = self._resample_audio(audio_array, input_sr, target_sr)
 
         # Extract mel features using WhisperFeatureExtractor
         # IMPORTANT: Set padding=False to prevent automatic padding to 30 seconds
@@ -636,45 +642,34 @@ class MultimodalTokenizer(TokenizerManager):
     def _load_audio_from_bytes(self, audio_bytes: bytes, target_sr: int = 24000) -> np.ndarray:
         """Load audio from bytes (wav, mp3, etc.) and resample to target_sr.
 
-        Falls back to raw float32 parsing if decoding fails.
+        Uses librosa for loading and resampling.
         """
-        # Try librosa (best for resampling and format support)
-        try:
-            import librosa
-            # librosa.load accepts file-like objects
-            with io.BytesIO(audio_bytes) as f:
-                audio_array, _ = librosa.load(f, sr=target_sr, mono=True)
-            return audio_array
-        except ImportError:
-            pass
-        except Exception as e:
-            # Only log warning if it looked like a file (header check) but failed
-            # If it's raw bytes, librosa will likely fail, which is expected
-            if len(audio_bytes) > 4 and audio_bytes[:4] in (b'RIFF', b'ID3\x03'):
-                 logger.warning("Failed to decode audio file with librosa: %s. Trying fallback.", e)
+        import librosa
 
-        # Try soundfile
-        try:
-            import soundfile as sf
-            with io.BytesIO(audio_bytes) as f:
-                audio_array, sr = sf.read(f)
-                if sr != target_sr:
-                     logger.warning("Soundfile loaded audio with sr=%d, but target is %d. No resampling applied (install librosa for best results).", sr, target_sr)
-                audio_array = audio_array.astype(np.float32)
-                if audio_array.ndim > 1:
-                    audio_array = audio_array.mean(axis=1)
-            return audio_array
-        except ImportError:
-            pass
-        except Exception:
-            pass
-        
-        # Fallback: Treat as raw PCM float32 (legacy behavior)
-        # Only warn if it looks like it shouldn't be raw
-        if len(audio_bytes) > 4 and audio_bytes[:4] in (b'RIFF', b'ID3\x03', b'fLaC'):
-             logger.warning("Input looks like an audio file (WAV/MP3/FLAC) but decoding libraries (librosa/soundfile) failed or are missing. Parsing as raw PCM, which will likely produce noise.")
-        
-        return np.frombuffer(audio_bytes, dtype=np.float32)
+        with io.BytesIO(audio_bytes) as f:
+            audio_array, _ = librosa.load(f, sr=target_sr, mono=True)
+        return audio_array
+
+    def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """Resample audio to target sample rate using librosa.
+
+        Args:
+            audio: Input audio array.
+            orig_sr: Original sample rate.
+            target_sr: Target sample rate.
+
+        Returns:
+            Resampled audio array.
+        """
+        if orig_sr == target_sr:
+            return audio
+
+        import librosa
+
+        resampled = librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
+        logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
+                    orig_sr, target_sr, len(audio), len(resampled))
+        return resampled.astype(np.float32)
 
     async def asr(
         self,
