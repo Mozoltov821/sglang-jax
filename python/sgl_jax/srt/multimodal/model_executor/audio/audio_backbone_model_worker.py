@@ -206,7 +206,7 @@ class AudioBackboneModelWorker:
             self.reset_cache_state(rid)
 
         logger.info(
-            "AudioBackboneModelWorker.forward: input_ids shape=%s, dtype=%s,input_ids:",
+            "AudioBackboneModelWorker.forward: input_ids shape=%s, dtype=%s,input_ids:%s",
             input_ids.shape if input_ids is not None else None,
             input_ids.dtype if input_ids is not None else None,
             input_ids
