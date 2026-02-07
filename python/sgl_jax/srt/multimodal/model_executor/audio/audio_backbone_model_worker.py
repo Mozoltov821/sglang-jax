@@ -32,14 +32,14 @@ class AudioBackboneModelWorker:
     def _create_forward_batch(
         self,
         input_ids: jax.Array,
-        seq_lens: np.ndarray,
+        positions_override: jax.Array = None,
         is_prefill: bool = True,
     ) -> ForwardBatch:
         """Create ForwardBatch for RadixAttention.
 
         Args:
             input_ids: [B, channels, seq_len]
-            seq_lens: Sequence lengths for each request
+            positions_override: Optional positions array to use instead of computing
             is_prefill: Whether this is prefill or decode phase
 
         Returns:
@@ -48,12 +48,24 @@ class AudioBackboneModelWorker:
         B, _, seq_len = input_ids.shape
         T_groups = seq_len // MIMO_GROUP_SIZE  # Number of groups (positions for main transformer)
 
-        # For MiMo, positions are based on T_groups, not seq_len
-        if is_prefill:
+        # Use provided positions or compute based on mode
+        if positions_override is not None:
+            positions = positions_override
+            # Determine mode based on positions length
+            if positions.shape[0] == T_groups:
+                forward_mode = ForwardMode.EXTEND
+                extend_start_loc = jnp.array([0], dtype=jnp.int32)
+                extend_seq_lens = jnp.array([T_groups] * B, dtype=jnp.int32)
+                extend_prefix_lens = jnp.zeros(B, dtype=jnp.int32)
+            else:
+                forward_mode = ForwardMode.DECODE
+                extend_start_loc = None
+                extend_seq_lens = None
+                extend_prefix_lens = None
+        elif is_prefill:
             # Prefill: positions for all groups
             positions = jnp.arange(T_groups, dtype=jnp.int32)
             forward_mode = ForwardMode.EXTEND
-            # For extend mode, we need extend_start_loc and extend_seq_lens
             extend_start_loc = jnp.array([0], dtype=jnp.int32)
             extend_seq_lens = jnp.array([T_groups] * B, dtype=jnp.int32)
             extend_prefix_lens = jnp.zeros(B, dtype=jnp.int32)
@@ -135,6 +147,7 @@ class AudioBackboneModelWorker:
         Args:
             batch: Request batch containing pre-aggregated input_ids
             cache: Optional KV cache (unused, for interface compatibility)
+            positions: Optional positions array from kwargs
 
         Returns:
             (text_logits, local_hidden_states, cache), cache_miss_count
@@ -177,13 +190,15 @@ class AudioBackboneModelWorker:
         B, _, padded_seq_len = input_ids.shape
         T_groups = padded_seq_len // MIMO_GROUP_SIZE
 
-        # Check if positions are provided (for decode steps)
-        positions = kwargs.get("positions", None)
-        is_prefill = positions is None
+        # Get positions from kwargs if provided
+        positions_override = kwargs.get("positions", None)
+
+        # Determine prefill mode: prefill if no positions provided
+        is_prefill = positions_override is None
 
         # Create ForwardBatch and LogitsMetadata
-        forward_batch = self._create_forward_batch(input_ids, None, is_prefill)
-        logits_metadata = self._create_logits_metadata(B, T_groups, is_prefill)
+        forward_batch = self._create_forward_batch(input_ids, positions_override, is_prefill)
+        logits_metadata = self._create_logits_metadata(B, T_groups, forward_batch.forward_mode.is_extend())
 
         return self.model_runner.forward(input_ids, forward_batch, logits_metadata, **kwargs)
 
