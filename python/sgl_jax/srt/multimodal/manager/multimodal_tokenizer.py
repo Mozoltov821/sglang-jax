@@ -320,6 +320,10 @@ class MultimodalTokenizer(TokenizerManager):
             mels.shape,
             input_lens,
         )
+        logger.info(
+            "  Mel stats: min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
+            mels.min(), mels.max(), mels.mean(), mels.std()
+        )
 
         return mels, input_lens
 
@@ -737,8 +741,23 @@ class MultimodalTokenizer(TokenizerManager):
         """
         import librosa
 
+        # Check if it's a valid audio file format
+        if audio_bytes[:4] == b'RIFF':
+            logger.debug("Detected WAV format (RIFF header)")
+        elif audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+            logger.debug("Detected MP3 format")
+        elif audio_bytes[:4] == b'fLaC':
+            logger.debug("Detected FLAC format")
+        elif audio_bytes[:4] == b'OggS':
+            logger.debug("Detected OGG format")
+        else:
+            logger.warning("Unknown audio format, first 4 bytes: %s", audio_bytes[:4].hex())
+
         with io.BytesIO(audio_bytes) as f:
-            audio_array, _ = librosa.load(f, sr=target_sr, mono=True)
+            audio_array, orig_sr = librosa.load(f, sr=target_sr, mono=True)
+
+        logger.debug("librosa.load: orig_sr=%s, target_sr=%d, samples=%d",
+                     orig_sr, target_sr, len(audio_array))
         return audio_array
 
     def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
@@ -794,9 +813,24 @@ class MultimodalTokenizer(TokenizerManager):
                     raise ValueError("Invalid base64 string in audio_data")
             else:
                 audio_bytes = obj.audio_data
-            
+
+            # Debug: log audio bytes info
+            logger.info("=" * 60)
+            logger.info("ASR Audio Loading Debug:")
+            logger.info("  audio_bytes size: %d bytes", len(audio_bytes))
+            logger.info("  audio_bytes first 16 bytes: %s", audio_bytes[:16].hex())
+            logger.info("  target sample_rate: %d Hz", obj.sample_rate)
+
             # Use smart loader to handle WAV/MP3 or Raw PCM
             audio_array = self._load_audio_from_bytes(audio_bytes, target_sr=obj.sample_rate)
+
+            # Debug: log audio array info
+            logger.info("  audio_array shape: %s", audio_array.shape)
+            logger.info("  audio_array dtype: %s", audio_array.dtype)
+            logger.info("  audio_array min: %.6f, max: %.6f", audio_array.min(), audio_array.max())
+            logger.info("  audio_array mean: %.6f, std: %.6f", audio_array.mean(), audio_array.std())
+            logger.info("  audio duration: %.3f seconds", len(audio_array) / obj.sample_rate)
+            logger.info("=" * 60)
         else:
             raise ValueError("audio_data is required for ASR")
 
