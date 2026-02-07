@@ -185,32 +185,36 @@ class AudioBackboneScheduler:
             positions = device_array(positions_np, sharding=pos_sharding)
 
             # Forward pass
-            (text_logits, local_hidden_states, _), _ = self.backbone_worker.forward(
+            (text_logits_output, local_hidden_states, _), _ = self.backbone_worker.forward(
                 req, positions=positions
             )
-            
+
             # Update position
             current_pos += T_groups
 
-            # Move to CPU for sampling to avoid ShardingTypeError and allow easy masking
-            logits_np = np.array(jax.device_get(text_logits))
-            
+            # Extract next_token_logits from LogitsProcessorOutput
+            # next_token_logits shape: [B, vocab_size] (logits for last position only)
+            next_token_logits = text_logits_output.next_token_logits
+            logits_np = np.array(jax.device_get(next_token_logits))
+
             # Force text generation by masking out the empty token
-            logits_np[:, -1, MIMO_EMPTY_IDX] = -float('inf')
+            # logits_np shape is [B, vocab_size], not [B, seq_len, vocab_size]
+            logits_np[:, MIMO_EMPTY_IDX] = -float('inf')
 
             # Sample token (NumPy implementation)
+            # logits_np shape is [B, vocab_size]
             if sampler_config.do_sample:
                 # Apply temperature
-                logits = logits_np[:, -1, :] / max(sampler_config.temperature, 1e-5)
+                logits = logits_np / max(sampler_config.temperature, 1e-5)
                 # Numerical stability for softmax
                 logits = logits - np.max(logits, axis=-1, keepdims=True)
                 probs = np.exp(logits)
                 probs /= np.sum(probs, axis=-1, keepdims=True)
-                
+
                 # Sample
                 next_token_scalar = np.random.choice(probs.shape[-1], p=probs[0])
             else:
-                next_token_scalar = np.argmax(logits_np[:, -1, :], axis=-1)[0]
+                next_token_scalar = np.argmax(logits_np, axis=-1)[0]
             
             next_token_scalar = int(next_token_scalar)
             
