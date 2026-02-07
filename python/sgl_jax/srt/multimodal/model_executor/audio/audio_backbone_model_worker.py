@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch, ForwardMode
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import MiMoSamplerConfig
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 from sgl_jax.srt.multimodal.model_executor.audio.audio_backbone_model_runner import (
@@ -124,6 +124,7 @@ class AudioBackboneModelWorker:
         if is_prefill:
             return LogitsMetadata(
                 forward_mode=ForwardMode.EXTEND,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
                 extend_seq_lens=jnp.array([seq_len] * batch_size, dtype=jnp.int32),
                 extend_seq_lens_cpu=[seq_len] * batch_size,
                 top_logprobs_nums=[0] * batch_size,
@@ -131,6 +132,7 @@ class AudioBackboneModelWorker:
         else:
             return LogitsMetadata(
                 forward_mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
                 top_logprobs_nums=[0] * batch_size,
             )
 
