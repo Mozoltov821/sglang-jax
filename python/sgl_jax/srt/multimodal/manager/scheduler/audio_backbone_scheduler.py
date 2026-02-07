@@ -129,6 +129,9 @@ class AudioBackboneScheduler:
             if getattr(req, "is_prefill", True):
                 self.backbone_worker.reset_cache_state(req.rid)
 
+                # Dump first entry to stage1 for debugging
+                self._dump_stage1_input(req)
+
             # Forward through main transformer
             (text_logits_output, local_hidden_states, _), _ = self.backbone_worker.forward(
                 req
@@ -201,3 +204,40 @@ class AudioBackboneScheduler:
             top_k=getattr(req, "top_k", 0),
             top_p=getattr(req, "top_p", 1.0),
         )
+
+    def _dump_stage1_input(self, req: Req):
+        """Dump stage1 input data for debugging."""
+        import os
+        import pickle
+        from datetime import datetime
+
+        dump_dir = "/tmp/stage1_dumps"
+        os.makedirs(dump_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dump_file = os.path.join(dump_dir, f"stage1_input_{req.rid}_{timestamp}.pkl")
+
+        dump_data = {
+            "rid": req.rid,
+            "audio_mode": req.audio_mode,
+            "input_ids": jax.device_get(req.input_ids) if req.input_ids is not None else None,
+            "audio_codes": jax.device_get(req.audio_codes) if req.audio_codes is not None else None,
+            "prompt_input_ids": getattr(req, "prompt_input_ids", None),
+            "text_input_ids": getattr(req, "text_input_ids", None),
+            "is_prefill": getattr(req, "is_prefill", None),
+        }
+
+        with open(dump_file, "wb") as f:
+            pickle.dump(dump_data, f)
+
+        logger.info("=" * 60)
+        logger.info("Stage1 Input Dump saved to: %s", dump_file)
+        logger.info("  rid: %s", req.rid)
+        logger.info("  audio_mode: %s", req.audio_mode)
+        if dump_data["input_ids"] is not None:
+            logger.info("  input_ids shape: %s", dump_data["input_ids"].shape)
+            logger.info("  input_ids dtype: %s", dump_data["input_ids"].dtype)
+        if dump_data["audio_codes"] is not None:
+            logger.info("  audio_codes shape: %s", dump_data["audio_codes"].shape)
+            logger.info("  audio_codes dtype: %s", dump_data["audio_codes"].dtype)
+        logger.info("=" * 60)
