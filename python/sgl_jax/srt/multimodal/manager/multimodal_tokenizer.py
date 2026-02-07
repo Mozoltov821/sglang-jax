@@ -847,9 +847,9 @@ class MultimodalTokenizer(TokenizerManager):
 
         # 2. Construct Prompt Segments (Manual construction for precise Audio placement)
         # Official format: <|im_start|>user\n [AUDIO] {prompt} <|im_end|>\n<|im_start|>assistant\n
-        
+
         prefix_text = "<|im_start|>user\n"
-        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
+        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n"
         
         prefix_ids = []
         suffix_ids = []
