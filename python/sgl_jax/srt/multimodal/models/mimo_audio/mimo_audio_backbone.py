@@ -9,7 +9,7 @@ from flax import nnx
 from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import Embed, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -476,12 +476,12 @@ class MiMoAudioForCausalLM(nnx.Module):
         )
 
         # LM head for text
-        self.lm_head = LinearBase(
-            input_size=config.hidden_size,
-            output_size=config.vocab_size,
-            use_bias=False,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_axes=("tensor", None),
             mesh=mesh,
         )
 
@@ -669,8 +669,9 @@ class MiMoAudioForCausalLM(nnx.Module):
         # Passing None for forward_batch and token_to_kv_pool triggers simple attention
         hidden_states, _, _ = self.model(inputs_embeds, positions, None, None)
 
-        # Get text logits for all positions
-        text_logits, _ = self.lm_head(hidden_states)  # [B, T_groups, vocab_size]
+        # Get text logits using ParallelLMHead's embedding matrix
+        hidden_states_promoted, embedding = self.lm_head.promote_dtype(hidden_states)
+        text_logits = jnp.matmul(hidden_states_promoted, embedding.T)  # [B, T_groups, vocab_size]
 
         # Downcast hidden states for local transformer
         local_hidden_states, _ = self.hidden_states_downcast(
