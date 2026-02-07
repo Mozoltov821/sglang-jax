@@ -174,14 +174,15 @@ class MultimodalTokenizer(TokenizerManager):
                     n_mels = config.get("n_mels", 128)
 
                     # Create mel filter bank
+                    # Use HTK mel scale and no norm to match torchaudio defaults
                     self.mel_filters = mel_filter_bank(
                         num_frequency_bins=n_fft // 2 + 1,
                         num_mel_filters=n_mels,
                         min_frequency=f_min,
                         max_frequency=f_max,
                         sampling_rate=sample_rate,
-                        norm="slaney",
-                        mel_scale="slaney",
+                        norm=None,  # Match torchaudio default (no area normalization)
+                        mel_scale="htk",  # Match torchaudio default
                     )
 
                     # Create window function
@@ -235,14 +236,15 @@ class MultimodalTokenizer(TokenizerManager):
         n_mels = 128
 
         # Create mel filter bank
+        # Use HTK mel scale and no norm to match torchaudio defaults
         self.mel_filters = mel_filter_bank(
             num_frequency_bins=n_fft // 2 + 1,
             num_mel_filters=n_mels,
             min_frequency=f_min,
             max_frequency=f_max,
             sampling_rate=sample_rate,
-            norm="slaney",
-            mel_scale="slaney",
+            norm=None,  # Match torchaudio default (no area normalization)
+            mel_scale="htk",  # Match torchaudio default
         )
 
         # Create window function
