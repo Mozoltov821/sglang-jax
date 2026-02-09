@@ -16,7 +16,6 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.models.qwen2 import Qwen2MLP, Qwen2Attention  # Reuse Qwen2 components
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
     MiMoAudioBackboneConfig,
@@ -28,15 +27,62 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone_weights_mappin
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 
-# Note: MiMoAudioMLP has been removed. We now use Qwen2MLP directly.
-# The implementations are identical (SwiGLU with gate_proj, up_proj, down_proj).
+class MiMoAudioMLP(nnx.Module):
+    """SwiGLU MLP for MiMo Audio model."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        mesh: jax.sharding.Mesh,
+        layer_id: int = 0,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        self.layer_id = layer_id
+
+        self.gate_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=intermediate_size,
+            kernel_axes=(None, "tensor"),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+
+        self.up_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=intermediate_size,
+            kernel_axes=(None, "tensor"),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+
+        self.down_proj = LinearBase(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            kernel_axes=("tensor", None),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+
+        self.act_fn = jax.nn.silu
+
+    def __call__(self, hidden_states: jax.Array):
+        a1, _ = self.gate_proj(hidden_states)
+        a2, _ = self.up_proj(hidden_states)
+        intermediate_parallel = a2 * self.act_fn(a1)
+        output, _ = self.down_proj(intermediate_parallel)
+        return output
 
 
-class MiMoAudioAttention(Qwen2Attention):
-    """Attention layer that extends Qwen2Attention with standard attention support.
+class MiMoAudioAttention(nnx.Module):
+    """Attention layer for MiMo Audio model.
 
-    Inherits Q/K/V/O projections, RoPE, and RadixAttention from Qwen2Attention.
-    Adds a second branch for standard attention (no KV cache) used by Patch Encoder/Decoder.
+    Supports two modes:
+    - RadixAttention: Used when token_to_kv_pool is provided (main model).
+    - Standard Attention: Used when token_to_kv_pool is None (Patch Encoder/Decoder).
     """
 
     def __init__(
@@ -53,49 +99,65 @@ class MiMoAudioAttention(Qwen2Attention):
         use_causal_mask: bool = True,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
-        # Call parent class __init__ to set up Q/K/V/O projections, RoPE, and RadixAttention
-        super().__init__(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            max_position_embeddings=max_position_embeddings,
+        self.layer_id = layer_id
+        self.head_dim = head_dim
+        self.q_head_num = num_heads
+        self.kv_head_num = num_kv_heads
+        self.use_causal_mask = use_causal_mask
+        self.scaling = head_dim**-0.5
+
+        # Q/K/V/O projections
+        self.q_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=num_heads * head_dim,
+            use_bias=use_bias,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
             mesh=mesh,
-            rope_theta=rope_theta,
-            head_dim=head_dim,
-            layer_id=layer_id,
+        )
+        self.k_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=num_kv_heads * head_dim,
+            use_bias=use_bias,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.v_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=num_kv_heads * head_dim,
+            use_bias=use_bias,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+        self.o_proj = LinearBase(
+            input_size=num_heads * head_dim,
+            output_size=hidden_size,
+            use_bias=False,
+            kernel_axes=("tensor", None),
+            params_dtype=dtype,
+            mesh=mesh,
+        )
+
+        # Rotary Position Embedding
+        self.rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=rope_theta,
+            is_neox_style=True,
             dtype=dtype,
         )
-        # Store additional attributes for standard attention branch
-        self.use_causal_mask = use_causal_mask
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
 
-        # Override Q/K/V projections if use_bias differs from Qwen2's default (True)
-        if not use_bias:
-            self.q_proj = LinearBase(
-                input_size=hidden_size,
-                output_size=num_heads * self.head_dim,
-                use_bias=False,
-                kernel_axes=(None, "tensor"),
-                params_dtype=dtype,
-                mesh=mesh,
-            )
-            self.k_proj = LinearBase(
-                input_size=hidden_size,
-                output_size=num_kv_heads * self.head_dim,
-                use_bias=False,
-                kernel_axes=(None, "tensor"),
-                params_dtype=dtype,
-                mesh=mesh,
-            )
-            self.v_proj = LinearBase(
-                input_size=hidden_size,
-                output_size=num_kv_heads * self.head_dim,
-                use_bias=False,
-                kernel_axes=(None, "tensor"),
-                params_dtype=dtype,
-                mesh=mesh,
-            )
+        # RadixAttention for KV cache mode
+        self.attn = RadixAttention(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            scaling=self.scaling,
+            num_kv_heads=num_kv_heads,
+            layer_id=layer_id,
+        )
 
     def __call__(
         self,
@@ -109,9 +171,21 @@ class MiMoAudioAttention(Qwen2Attention):
         Branch 1 (RadixAttention): Used when token_to_kv_pool is provided (main model).
         Branch 2 (Standard): Used when token_to_kv_pool is None (Patch Encoder/Decoder).
         """
-        # Branch 1: RadixAttention (inherited from Qwen2Attention)
+        # Branch 1: RadixAttention (for main model with KV cache)
         if token_to_kv_pool is not None:
-            return super().__call__(positions, hidden_states, forward_batch, token_to_kv_pool)
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
+
+            q = q.reshape(-1, self.q_head_num, self.head_dim)
+            k = k.reshape(-1, self.kv_head_num, self.head_dim)
+            v = v.reshape(-1, self.kv_head_num, self.head_dim)
+
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+
+            output, _ = self.o_proj(attn_output)
+            return output, kv_fused
 
         # Branch 2: Standard Attention (Stateless / Patch Encoder/Decoder)
         batch_size, seq_len, _ = hidden_states.shape
@@ -190,7 +264,7 @@ class MiMoAudioDecoderLayer(nnx.Module):
             use_causal_mask=use_causal_mask,
             dtype=dtype,
         )
-        self.mlp = Qwen2MLP(
+        self.mlp = MiMoAudioMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             mesh=mesh,
