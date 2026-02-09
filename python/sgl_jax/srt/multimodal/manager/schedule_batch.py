@@ -16,6 +16,7 @@ NegativePromptSuffix = "_negative"
 MIMO_AUDIO_GROUP_SIZE = 4
 MIMO_AUDIO_CHANNELS = 8
 MIMO_SPEECH_EMPTY_IDS = (1024, 1024, 128, 128, 128, 128, 128, 128)
+MIMO_SPEECH_VOCAB_SIZES = (1025, 1025, 129, 129, 129, 129, 129, 129)  # For token validation
 MIMO_EMPTY_IDX = 151667       # <|empty|> - text placeholder in audio patches
 MIMO_SOSP_IDX = 151665        # <|sosp|> - start of speech
 MIMO_EOSP_IDX = 151666        # <|eosp|> - end of speech
@@ -517,6 +518,9 @@ class Req:
         Returns:
             Tensor of shape [1, 9, group_size] for next step input.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         if self.generated_text_tokens is None or len(self.generated_text_tokens) == 0:
             raise ValueError("No generated text tokens to build next step input")
 
@@ -536,8 +540,25 @@ class Req:
             if hasattr(audio_tokens, "shape") and audio_tokens.ndim == 3:
                 # Take first batch item and transpose
                 audio_rows = audio_tokens[0].T.astype(jnp.int32)
+
+                # Validate and clamp audio tokens to valid ranges
                 for i in range(MIMO_AUDIO_CHANNELS):
-                    rows.append(audio_rows[i])
+                    row = audio_rows[i]
+                    vocab_size = MIMO_SPEECH_VOCAB_SIZES[i]
+                    max_val = int(jnp.max(row))
+                    min_val = int(jnp.min(row))
+
+                    if max_val >= vocab_size or min_val < 0:
+                        logger.error(
+                            "INVALID audio token in channel %d: min=%d, max=%d, vocab_size=%d. "
+                            "Replacing with empty IDs.",
+                            i, min_val, max_val, vocab_size
+                        )
+                        # Replace with empty IDs to prevent NaN propagation
+                        row = jnp.full(
+                            (MIMO_AUDIO_GROUP_SIZE,), MIMO_SPEECH_EMPTY_IDS[i], dtype=jnp.int32
+                        )
+                    rows.append(row)
             else:
                 # Fallback: fill with empty IDs
                 for ch in range(MIMO_AUDIO_CHANNELS):

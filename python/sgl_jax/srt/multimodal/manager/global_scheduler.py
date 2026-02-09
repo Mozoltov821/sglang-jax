@@ -397,7 +397,7 @@ class GlobalScheduler:
         try:
             req.input_ids = req.build_next_step_input()
             logger.info(
-                "Backbone continue for rid=%s, step=%d, input_ids shape=%s",
+                "\n\nBackbone continue for rid=%s, step=%d, input_ids shape=%s",
                 req.rid,
                 len(tracking_state.accumulated_text_tokens),
                 req.input_ids.shape if req.input_ids is not None else None,

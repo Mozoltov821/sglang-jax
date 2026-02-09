@@ -145,11 +145,42 @@ class AudioBackboneScheduler:
             if logits_np.ndim == 3:
                 logits_np = logits_np[:, -1, :]
 
+            # === DEBUG: Check for NaN/Inf ===
+            step_num = self.backbone_worker._total_seq_lens.get(req.rid, 0)
+            nan_count = np.sum(np.isnan(logits_np))
+            inf_count = np.sum(np.isinf(logits_np))
+            if nan_count > 0 or inf_count > 0:
+                logger.error(
+                    "!!! NaN/Inf detected at step=%d, rid=%s: nan_count=%d, inf_count=%d",
+                    step_num, req.rid, nan_count, inf_count
+                )
+                # Check local_hidden_states
+                local_hs_np = np.array(jax.device_get(local_hidden_states))
+                logger.error(
+                    "  local_hidden_states: nan=%d, inf=%d, min=%.4f, max=%.4f",
+                    np.sum(np.isnan(local_hs_np)),
+                    np.sum(np.isinf(local_hs_np)),
+                    np.nanmin(local_hs_np),
+                    np.nanmax(local_hs_np),
+                )
+                # Check input_ids
+                if req.input_ids is not None:
+                    input_np = np.array(jax.device_get(req.input_ids))
+                    logger.error("  input_ids shape=%s, min=%d, max=%d", input_np.shape, input_np.min(), input_np.max())
+            else:
+                logger.info(
+                    "Step=%d: logits OK, min=%.4f, max=%.4f, mean=%.4f",
+                    step_num, logits_np.min(), logits_np.max(), logits_np.mean()
+                )
+            # === END DEBUG ===
+
             # Debug: show top-10 predicted tokens
             top_k = 10
             top_indices = np.argsort(logits_np[0])[-top_k:][::-1]
             top_logits = logits_np[0][top_indices]
             logger.info("Top-%d logits: %s", top_k, list(zip(top_indices.tolist(), top_logits.tolist())))
+
+
 
             # Sample token - let the model decide what to generate
             if sampler_config.do_sample:
@@ -173,12 +204,31 @@ class AudioBackboneScheduler:
 
             # Check if model wants to generate audio (output <|empty|>)
             if text_token_id == MIMO_EMPTY_IDX:
-                # Model decided to generate audio
-                self.rng_key, subkey = jax.random.split(self.rng_key)
-                audio_tokens, _ = self.backbone_worker.patch_decode(
-                    local_hidden_states, subkey, sampler_config
-                )
-                req.generated_audio_tokens = jax.device_get(audio_tokens)
+                # Check for NaN in local_hidden_states before patch_decode
+                local_hs_np = np.array(jax.device_get(local_hidden_states))
+                if np.any(np.isnan(local_hs_np)):
+                    logger.error(
+                        "NaN in local_hidden_states BEFORE patch_decode at step=%d, rid=%s. "
+                        "Skipping audio generation.",
+                        step_num, req.rid
+                    )
+                    req.generated_audio_tokens = None
+                else:
+                    # Model decided to generate audio
+                    self.rng_key, subkey = jax.random.split(self.rng_key)
+                    audio_tokens, _ = self.backbone_worker.patch_decode(
+                        local_hidden_states, subkey, sampler_config
+                    )
+                    audio_tokens_np = jax.device_get(audio_tokens)
+
+                    # Validate generated audio tokens
+                    max_token = np.max(audio_tokens_np)
+                    if max_token > 1024:  # Max possible valid token
+                        logger.error(
+                            "patch_decode produced invalid tokens: max=%d at step=%d, rid=%s",
+                            max_token, step_num, req.rid
+                        )
+                    req.generated_audio_tokens = audio_tokens_np
             else:
                 # Model generated text token, no audio needed
                 req.generated_audio_tokens = None

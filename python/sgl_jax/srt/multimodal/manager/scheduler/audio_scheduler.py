@@ -103,11 +103,44 @@ class AudioScheduler:
                     output, _ = self.audio_worker.forward(
                         req, mode="encode", use_quantizer=req.use_quantizer, n_q=req.n_q
                     )
-                    req.output = jax.device_get(output.codes)
-                    logger.info(
-                        "AudioScheduler encode output: codes shape=%s",
-                        req.output.shape if req.output is not None else None,
-                    )
+                    codes = jax.device_get(output.codes)
+                    output_lens = jax.device_get(output.output_lengths)
+
+                    # DEBUG: Check audio codes range and valid length
+                    if codes is not None:
+                        logger.info(
+                            "AudioScheduler encode output: codes shape=%s, output_lens=%s",
+                            codes.shape,
+                            output_lens,
+                        )
+
+                        # IMPORTANT: Replace codes beyond valid length with empty IDs
+                        # The encoder produces random codes for masked positions, we need to fix them
+                        if output_lens is not None and len(output_lens) > 0:
+                            valid_len = int(output_lens[0])
+                            total_len = codes.shape[1]
+
+                            if valid_len < total_len:
+                                logger.info(
+                                    "Fixing audio codes: valid_len=%d, total_len=%d, "
+                                    "replacing positions %d-%d with empty IDs",
+                                    valid_len, total_len, valid_len, total_len - 1
+                                )
+                                # Import empty IDs
+                                from sgl_jax.srt.multimodal.manager.schedule_batch import MIMO_SPEECH_EMPTY_IDS
+
+                                # Replace invalid positions with empty IDs for each channel
+                                import numpy as np
+                                codes = np.array(codes)  # Convert to numpy for easier manipulation
+                                for ch in range(min(codes.shape[0], 8)):
+                                    empty_id = MIMO_SPEECH_EMPTY_IDS[ch]
+                                    codes[ch, valid_len:] = empty_id
+                                    logger.info(
+                                        "  Channel %d: replaced %d invalid codes with empty_id=%d",
+                                        ch, total_len - valid_len, empty_id
+                                    )
+
+                    req.output = codes
                 else:
                     logger.info(
                         "AudioScheduler skipping encode for mode=%s, rid=%s (no mel_input)",
