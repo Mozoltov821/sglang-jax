@@ -370,23 +370,45 @@ def forward_attention(
         finite_logits = jnp.where(finite_mask, attn_logits, 0.0)
         logits_min = jnp.min(jnp.where(finite_mask, attn_logits, jnp.inf))
         logits_max = jnp.max(finite_logits)
+
+        # Count how many logits are extremely large (> 30000)
+        extreme_count = jnp.sum(finite_logits > 30000)
+        # Check logits mean and std (excluding -inf)
+        finite_count = jnp.sum(finite_mask)
+        logits_mean = jnp.sum(finite_logits) / jnp.maximum(finite_count, 1)
+
         jax.debug.print(
             "forward_attn0 after_mask: logits_nan={logits_nan}, logits_inf={logits_inf}, "
             "any_row_all_masked={any_row_all_masked}, seq_lens={seq_lens}, "
-            "logits_min={logits_min}, logits_max={logits_max}",
+            "logits_min={logits_min}, logits_max={logits_max}, "
+            "extreme_count={extreme_count}, logits_mean={logits_mean}",
             logits_nan=jnp.any(jnp.isnan(attn_logits)),
             logits_inf=jnp.any(jnp.isinf(attn_logits)),
             any_row_all_masked=jnp.any(row_all_neg_inf),
             seq_lens=seq_lengths,
             logits_min=logits_min,
             logits_max=logits_max,
+            extreme_count=extreme_count,
+            logits_mean=logits_mean,
         )
+        if layer_id == 0:
+            jax.debug.print(
+                "forward_attn0 attn_logits :  shape = {attn_shape} _值={weights}",
+                attn_shape = attn_logits.shape,
+                weights= attn_logits,
+            )
 
     # Softmax
     attn_weights = jax.nn.softmax(attn_logits, axis=-1)
 
     # DEBUG: Check attention weights after softmax (Layer 0 only)
     if layer_id == 0:
+        jax.debug.print(
+            "forward_attn0 after_softmax: attention shape = {attn_shape}attention_值={weights}",
+            attn_shape = attn_weights.shape,
+            weights= attn_weights,
+        )
+
         jax.debug.print(
             "forward_attn0 after_softmax: weights_nan={weights_nan}, weights_inf={weights_inf}",
             weights_nan=jnp.any(jnp.isnan(attn_weights)),
