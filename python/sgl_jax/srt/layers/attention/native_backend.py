@@ -391,15 +391,19 @@ def forward_attention(
             extreme_count=extreme_count,
             logits_mean=logits_mean,
         )
-        if layer_id == 0:
-            jax.debug.print(
-                "forward_attn0 attn_logits :  shape = {attn_shape} _值={weights}",
-                attn_shape = attn_logits.shape,
-                weights= attn_logits,
-            )
+        # if layer_id == 0:
+        #     jax.debug.print(
+        #         "forward_attn0 attn_logits :  shape = {attn_shape} _值={weights}",
+        #         attn_shape = attn_logits.shape,
+        #         weights= attn_logits,
+        #     )
 
     # Softmax
+    # attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+
+    attn_logits = attn_logits - jnp.max(attn_logits, axis=-1, keepdims=True)
     attn_weights = jax.nn.softmax(attn_logits, axis=-1)
+
 
     # DEBUG: Check attention weights after softmax (Layer 0 only)
     if layer_id == 0:
