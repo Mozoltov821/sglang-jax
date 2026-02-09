@@ -1,6 +1,7 @@
 """MiMo Audio Backbone model implementation for sglang-jax."""
 # Forced sync update
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import jax
@@ -16,6 +17,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.models.qwen2 import Qwen2DecoderLayer  # Import Qwen2 components
 from sgl_jax.srt.multimodal.configs.audio.mimo_audio_backbone_config import (
     MiMoAudioArguments,
     MiMoAudioBackboneConfig,
@@ -25,6 +27,20 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone_weights_mappin
     to_mappings,
 )
 from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+
+@dataclass
+class Qwen2ConfigAdapter:
+    """Adapter to make MiMoAudioBackboneConfig compatible with Qwen2DecoderLayer."""
+    hidden_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    intermediate_size: int
+    max_position_embeddings: int
+    rope_theta: float
+    rms_norm_eps: float
+    head_dim: int = None
+    rope_scaling: dict = None
 
 
 class MiMoAudioMLP(nnx.Module):
@@ -399,7 +415,11 @@ class MiMoAudioDecoderLayer(nnx.Module):
 
 
 class MiMoAudioTransformer(nnx.Module):
-    """Reusable transformer model for MiMo Audio (main/local/input_local)."""
+    """Reusable transformer model for MiMo Audio (main/local/input_local).
+
+    For the main model (has_embedder=True, use_kv_cache=True), uses Qwen2DecoderLayer
+    for better stability. For patch encoder/decoder, uses MiMoAudioDecoderLayer.
+    """
 
     def __init__(
         self,
@@ -417,10 +437,12 @@ class MiMoAudioTransformer(nnx.Module):
         use_bias: bool = True,
         use_causal_mask: bool = True,
         has_embedder: bool = True,
+        use_qwen2_layers: bool = False,  # New: use Qwen2DecoderLayer
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.has_embedder = has_embedder
         self.hidden_size = hidden_size
+        self.use_qwen2_layers = use_qwen2_layers
 
         if has_embedder:
             self.embed_tokens = Embed(
@@ -432,24 +454,47 @@ class MiMoAudioTransformer(nnx.Module):
                 mesh=mesh,
             )
 
-        self.layers = nnx.List([
-            MiMoAudioDecoderLayer(
+        if use_qwen2_layers:
+            # Use Qwen2DecoderLayer for main model (more stable)
+            config = Qwen2ConfigAdapter(
                 hidden_size=hidden_size,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
+                num_attention_heads=num_heads,
+                num_key_value_heads=num_kv_heads,
                 intermediate_size=intermediate_size,
                 max_position_embeddings=max_position_embeddings,
                 rope_theta=rope_theta,
                 rms_norm_eps=rms_norm_eps,
-                mesh=mesh,
-                layer_id=i,
-                use_bias=use_bias,
-                use_causal_mask=use_causal_mask,
-                dtype=dtype,
+                head_dim=head_dim,
             )
-            for i in range(num_layers)
-        ])
+            self.layers = nnx.List([
+                Qwen2DecoderLayer(
+                    config=config,
+                    mesh=mesh,
+                    layer_id=i,
+                    dtype=dtype,
+                )
+                for i in range(num_layers)
+            ])
+        else:
+            # Use MiMoAudioDecoderLayer for patch encoder/decoder
+            self.layers = nnx.List([
+                MiMoAudioDecoderLayer(
+                    hidden_size=hidden_size,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    intermediate_size=intermediate_size,
+                    max_position_embeddings=max_position_embeddings,
+                    rope_theta=rope_theta,
+                    rms_norm_eps=rms_norm_eps,
+                    mesh=mesh,
+                    layer_id=i,
+                    use_bias=use_bias,
+                    use_causal_mask=use_causal_mask,
+                    dtype=dtype,
+                )
+                for i in range(num_layers)
+            ])
 
         self.norm = RMSNorm(
             hidden_size,
@@ -487,23 +532,26 @@ class MiMoAudioTransformer(nnx.Module):
         layers_callback_flag = []
 
         for layer_idx, layer in enumerate(self.layers):
-            hidden_states, residual, kv_fused, callback_flag = layer(
-                hidden_states,
-                positions,
-                forward_batch,
-                token_to_kv_pool,
-                residual,
-            )
+            if self.use_qwen2_layers:
+                # Qwen2DecoderLayer: (positions, hidden_states, forward_batch, kv_pool, residual)
+                hidden_states, residual, kv_fused, callback_flag = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    token_to_kv_pool,
+                    residual,
+                )
+            else:
+                # MiMoAudioDecoderLayer: (hidden_states, positions, forward_batch, kv_pool, residual)
+                hidden_states, residual, kv_fused, callback_flag = layer(
+                    hidden_states,
+                    positions,
+                    forward_batch,
+                    token_to_kv_pool,
+                    residual,
+                )
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
-
-            # DEBUG: Check for NaN after first few layers only (to reduce overhead)
-            if layer_idx < 3:
-                jax.debug.print(
-                    "Layer {layer_idx}: has_nan={has_nan}",
-                    layer_idx=layer_idx,
-                    has_nan=jnp.any(jnp.isnan(hidden_states))
-                )
 
 
         if residual is not None:
@@ -529,7 +577,7 @@ class MiMoAudioForCausalLM(nnx.Module):
         self.mesh = mesh
         self.dtype = dtype
 
-        # Main Qwen2 model (36 layers)
+        # Main Qwen2 model (36 layers) - use Qwen2DecoderLayer for stability
         self.model = MiMoAudioTransformer(
             hidden_size=config.hidden_size,
             num_layers=config.num_hidden_layers,
@@ -545,6 +593,7 @@ class MiMoAudioForCausalLM(nnx.Module):
             use_bias=config.attention_bias,
             use_causal_mask=True,
             has_embedder=True,
+            use_qwen2_layers=True,  # Use Qwen2DecoderLayer for main model
             dtype=dtype,
         )
 
