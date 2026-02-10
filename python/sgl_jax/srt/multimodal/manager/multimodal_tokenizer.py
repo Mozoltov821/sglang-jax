@@ -28,6 +28,7 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     GenerateOpenAIAudioInput,
     TokenizedGenerateMMReqInput,
 )
+from sgl_jax.srt.multimodal.manager.prompt_builder import MultimodalPromptBuilder
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
     configure_logger,
@@ -81,6 +82,9 @@ class MultimodalTokenizer(TokenizerManager):
         self.audio_processor = None
         self.audio_config = {}
         self._init_audio_processor(server_args.model_path)
+
+        # Initialize multimodal prompt builder for audio tasks
+        self.prompt_builder = MultimodalPromptBuilder(tokenizer=self.tokenizer)
 
         self.rid_to_state: dict[str, MMReqState] = {}
         self._result_dispatcher = TypeBasedDispatcher(
@@ -595,17 +599,10 @@ class MultimodalTokenizer(TokenizerManager):
         self.auto_create_handle_loop()
         rid = uuid.uuid4().hex
 
-        # Tokenize the text input
-        text_input_ids = None
-        if obj.input and self.tokenizer is not None:
-            encoded = self.tokenizer(obj.input)
-            text_input_ids = encoded["input_ids"]
-
-        # Optional: encode voice/instructions as prompt
-        prompt_input_ids = None
-        if obj.instructions and self.tokenizer is not None:
-            encoded = self.tokenizer(obj.instructions)
-            prompt_input_ids = encoded["input_ids"]
+        # Build prompt using prompt builder
+        text_input_ids, prompt_input_ids = self.prompt_builder.build_and_tokenize_tts(
+            obj.input, obj.instructions
+        )
 
         from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
@@ -684,16 +681,8 @@ class MultimodalTokenizer(TokenizerManager):
         # Preprocess to mel spectrogram
         mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
 
-        # Build prompt (following MiMo format)
-        prefix_ids = None
-        suffix_ids = None
-        if self.tokenizer is not None:
-            prefix_text = "<|im_start|>user\n"
-            prompt_text = obj.prompt or "请转录这段音频"
-            suffix_text = f"{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
-
-            prefix_ids = self.tokenizer(prefix_text)["input_ids"]
-            suffix_ids = self.tokenizer(suffix_text)["input_ids"]
+        # Build prompt using prompt builder
+        prefix_ids, suffix_ids = self.prompt_builder.build_and_tokenize_asr(obj.prompt)
 
         from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
@@ -899,24 +888,13 @@ class MultimodalTokenizer(TokenizerManager):
                                 except Exception as e:
                                     logger.warning("Failed to download audio from URL: %s", e)
 
-        # 2. Construct Prompt Segments (Manual construction for precise Audio placement)
+        # 2. Construct Prompt using prompt builder
         # Official MiMo format: <|im_start|>user\n[AUDIO]{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n
         # Audio comes FIRST, then instruction/question
 
-        prefix_text = "<|im_start|>user\n"
-        suffix_text = f"{prompt_text.strip()}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
-        
-        prefix_ids = []
-        suffix_ids = []
-        
-        if self.tokenizer:
-            try:
-                # Tokenize prefix
-                prefix_ids = self.tokenizer(prefix_text)["input_ids"]
-                # Tokenize suffix
-                suffix_ids = self.tokenizer(suffix_text)["input_ids"]
-            except Exception as e:
-                logger.warning("Tokenization error in chat_completion_audio: %s", e)
+        prefix_ids, suffix_ids = self.prompt_builder.build_and_tokenize_audio_understanding(
+            prompt_text.strip()
+        )
 
         # 3. Process audio if present
         mel_input = None
