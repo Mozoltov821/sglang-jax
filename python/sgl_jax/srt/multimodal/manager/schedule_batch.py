@@ -181,7 +181,7 @@ class Req:
     use_quantizer: bool = True
     n_q: int | None = None
     sample_rate: int = 24000
-    audio_mode: str | None = None  # "encode", "decode", "generation", "tts"
+    audio_mode: str | None = None  # "tts", "asr", "audio_understanding"
 
     # TTS inputs
     text: str | None = None                     # TTS text to synthesize
@@ -320,13 +320,6 @@ class Req:
                 segments.append(self._build_text_segment(self.text_input_ids))
             # Add start-of-speech marker to signal audio generation
             segments.append(self._build_sosp_segment())
-
-        elif self.audio_mode == "generation":
-            # Audio generation/continuation: audio patches + optional text
-            if self.audio_codes is not None:
-                segments.append(self._build_audio_segment(self.audio_codes))
-            if self.text_input_ids:
-                segments.append(self._build_text_segment(self.text_input_ids))
 
         elif self.audio_mode == "audio_understanding":
             # Audio understanding: [prefix] + audio patches + question text

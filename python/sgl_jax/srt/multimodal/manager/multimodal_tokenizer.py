@@ -20,16 +20,13 @@ from transformers import AutoImageProcessor
 from sgl_jax.srt.managers.io_struct import AbortReq
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
-    ASRRequest,
-    ASRResponse,
-    AudioGenerationRequest,
-    AudioGenerationResponse,
+    AudioSpeechRequest,
+    AudioTranscriptionRequest,
+    AudioTranscriptionResponse,
     DataType,
     GenerateMMReqInput,
     GenerateOpenAIAudioInput,
     TokenizedGenerateMMReqInput,
-    TTSRequest,
-    TTSResponse,
 )
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
@@ -577,112 +574,37 @@ class MultimodalTokenizer(TokenizerManager):
                         f"Request is disconnected from the client side. Abort request rid={state.rid}"
                     )
 
-    async def generate_audio(
+    async def create_speech(
         self,
-        obj: AudioGenerationRequest,
+        obj: AudioSpeechRequest,
         request: fastapi.Request | None = None,
-    ):
-        created_time = time.time()
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._updating)
-
-        self.auto_create_handle_loop()
-
-        rid = uuid.uuid4().hex
-
-        if obj.audio_data:
-            audio_bytes = base64.b64decode(obj.audio_data)
-            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-        else:
-            audio_array = np.zeros((24000,), dtype=np.float32)
-
-        # Preprocess audio to mel spectrogram in tokenizer
-        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
-
-        input_ids = None
-        if obj.prompt and self.tokenizer is not None:
-            encoded = self.tokenizer(obj.prompt)
-            input_ids = encoded["input_ids"]
-
-        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-
-        audio_req = Req(
-            rid=rid,
-            mel_input=mel_input,
-            mel_input_lens=mel_input_lens,
-            audio_mode="generation",
-            sample_rate=obj.sample_rate,
-            data_type=DataType.AUDIO,
-            save_output=obj.save_output,
-            prompt=obj.prompt,
-            input_ids=input_ids,
-            n_q=8,
-        )
-
-        state = MMReqState(
-            rid=rid,
-            out_list=[],
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=created_time,
-        )
-        self.rid_to_state[rid] = state
-
-        self.send_to_scheduler.send_pyobj(audio_req)
-
-        try:
-            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
-        except TimeoutError:
-            raise ValueError(f"Audio generation request timed out for rid={rid}") from None
-
-        del self.rid_to_state[rid]
-
-        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
-
-        audio_data_b64 = None
-        if out.get("audio_data") is not None:
-            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
-            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-        return AudioGenerationResponse(
-            id=rid,
-            audio_data=audio_data_b64,
-            sample_rate=obj.sample_rate,
-        )
-
-    async def tts(
-        self,
-        obj: TTSRequest,
-        request: fastapi.Request | None = None,
-    ):
-        """Text-to-Speech: convert text to audio.
+    ) -> bytes:
+        """OpenAI-compatible TTS: convert text to audio.
 
         Args:
-            obj: TTSRequest containing text and optional voice prompt.
+            obj: AudioSpeechRequest containing text and voice parameters.
             request: FastAPI request object for disconnect handling.
 
         Returns:
-            TTSResponse containing the generated audio.
+            Raw audio bytes in the specified format.
         """
         created_time = time.time()
         async with self._cond:
             await self._cond.wait_for(lambda: not self._updating)
 
         self.auto_create_handle_loop()
-
         rid = uuid.uuid4().hex
 
         # Tokenize the text input
         text_input_ids = None
-        if obj.text and self.tokenizer is not None:
-            encoded = self.tokenizer(obj.text)
+        if obj.input and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.input)
             text_input_ids = encoded["input_ids"]
 
-        # Tokenize the voice prompt if provided
+        # Optional: encode voice/instructions as prompt
         prompt_input_ids = None
-        if obj.prompt and self.tokenizer is not None:
-            encoded = self.tokenizer(obj.prompt)
+        if obj.instructions and self.tokenizer is not None:
+            encoded = self.tokenizer(obj.instructions)
             prompt_input_ids = encoded["input_ids"]
 
         from sgl_jax.srt.multimodal.manager.schedule_batch import Req
@@ -690,12 +612,12 @@ class MultimodalTokenizer(TokenizerManager):
         tts_req = Req(
             rid=rid,
             audio_mode="tts",
-            text=obj.text,
+            text=obj.input,
             text_input_ids=text_input_ids,
-            prompt=obj.prompt,
+            prompt=obj.instructions,
             prompt_input_ids=prompt_input_ids,
             data_type=DataType.AUDIO,
-            save_output=obj.save_output,
+            sample_rate=24000,  # Default sample rate, can be adjusted based on response_format
         )
 
         state = MMReqState(
@@ -717,22 +639,140 @@ class MultimodalTokenizer(TokenizerManager):
 
         del self.rid_to_state[rid]
 
-        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
+        out = state.out_list[-1] if state.out_list else {}
 
-        audio_data_b64 = None
-        url = None
+        # Convert audio to specified format
         if out.get("audio_data") is not None:
-            audio_bytes = out["audio_data"].astype(np.float32).tobytes()
-            audio_data_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-        if out.get("url") is not None:
-            url = out["url"]
+            audio_array = out["audio_data"]
+            # TODO: Convert to obj.response_format (mp3, wav, pcm, etc.)
+            # For now, return raw float32 bytes (PCM)
+            audio_bytes = audio_array.astype(np.float32).tobytes()
+            return audio_bytes
+        else:
+            raise ValueError("No audio data generated")
 
-        return TTSResponse(
-            id=rid,
-            audio_data=audio_data_b64,
-            url=url,
+    async def create_transcription(
+        self,
+        obj: AudioTranscriptionRequest,
+        request: fastapi.Request | None = None,
+    ) -> AudioTranscriptionResponse | str:
+        """OpenAI-compatible ASR: convert audio to text.
+
+        Supports both file upload and URL download (handled by HTTP endpoint).
+
+        Args:
+            obj: AudioTranscriptionRequest containing audio data and parameters.
+            request: FastAPI request object for disconnect handling.
+
+        Returns:
+            Transcription in the specified format (AudioTranscriptionResponse or str).
+        """
+        created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
+        self.auto_create_handle_loop()
+        rid = uuid.uuid4().hex
+
+        # Get audio bytes (already processed by HTTP endpoint)
+        if obj.file is None:
+            raise ValueError("Audio file is required (should be handled by HTTP endpoint)")
+
+        # Load audio file
+        audio_array = self._load_audio_from_bytes(obj.file, target_sr=24000)
+
+        # Preprocess to mel spectrogram
+        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+
+        # Build prompt (following MiMo format)
+        prefix_ids = None
+        suffix_ids = None
+        if self.tokenizer is not None:
+            prefix_text = "<|im_start|>user\n"
+            prompt_text = obj.prompt or "请转录这段音频"
+            suffix_text = f"{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
+
+            prefix_ids = self.tokenizer(prefix_text)["input_ids"]
+            suffix_ids = self.tokenizer(suffix_text)["input_ids"]
+
+        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+
+        asr_req = Req(
+            rid=rid,
+            mel_input=mel_input,
+            mel_input_lens=mel_input_lens,
+            audio_mode="asr",
             sample_rate=24000,
+            data_type=DataType.AUDIO,
+            text_input_ids=suffix_ids,
+            prompt_input_ids=prefix_ids,
+            prompt=obj.prompt,
+            n_q=8,
         )
+
+        state = MMReqState(
+            rid=rid,
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            created_time=created_time,
+        )
+        self.rid_to_state[rid] = state
+
+        self.send_to_scheduler.send_pyobj(asr_req)
+
+        try:
+            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
+        except TimeoutError:
+            raise ValueError(f"ASR request timed out for rid={rid}") from None
+
+        del self.rid_to_state[rid]
+
+        out = state.out_list[-1] if state.out_list else {}
+
+        # Decode text
+        text = ""
+        if out.get("text") is not None:
+            text = out["text"]
+        elif out.get("generated_text_tokens") is not None and self.tokenizer is not None:
+            tokens = out["generated_text_tokens"]
+            if hasattr(tokens, "tolist"):
+                tokens = tokens.tolist()
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+        # Return different formats based on response_format
+        if obj.response_format == "text":
+            return text
+        elif obj.response_format == "srt":
+            # TODO: Generate SRT subtitle format
+            return self._format_as_srt(text, out.get("segments"))
+        elif obj.response_format == "vtt":
+            # TODO: Generate VTT subtitle format
+            return self._format_as_vtt(text, out.get("segments"))
+        else:  # json, verbose_json, diarized_json
+            return AudioTranscriptionResponse(
+                text=text,
+                task="transcribe",
+                language=obj.language,
+                # TODO: Add duration, segments, usage fields
+            )
+
+    def _format_as_srt(self, text: str, segments: list[dict] | None) -> str:
+        """Format transcription as SRT subtitles.
+
+        TODO: Implement SRT formatting with timestamps.
+        """
+        # Placeholder implementation
+        return f"1\n00:00:00,000 --> 00:00:10,000\n{text}\n"
+
+    def _format_as_vtt(self, text: str, segments: list[dict] | None) -> str:
+        """Format transcription as WebVTT subtitles.
+
+        TODO: Implement VTT formatting with timestamps.
+        """
+        # Placeholder implementation
+        return f"WEBVTT\n\n00:00:00.000 --> 00:00:10.000\n{text}\n"
 
     def _load_audio_from_bytes(self, audio_bytes: bytes, target_sr: int = 24000) -> np.ndarray:
         """Load audio from bytes (wav, mp3, etc.) and resample to target_sr.
@@ -804,142 +844,6 @@ class MultimodalTokenizer(TokenizerManager):
         logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
                     orig_sr, target_sr, len(audio), len(resampled))
         return resampled.numpy().astype(np.float32)
-
-    async def asr(
-        self,
-        obj: ASRRequest,
-        request: fastapi.Request | None = None,
-    ):
-        """Automatic Speech Recognition: convert audio to text.
-
-        Args:
-            obj: ASRRequest containing audio data and optional prompt.
-            request: FastAPI request object for disconnect handling.
-
-        Returns:
-            ASRResponse containing the transcribed text.
-        """
-        created_time = time.time()
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._updating)
-
-        self.auto_create_handle_loop()
-
-        rid = uuid.uuid4().hex
-
-        # Decode audio data from base64 or use raw bytes
-        if obj.audio_data:
-            if isinstance(obj.audio_data, str):
-                try:
-                    audio_bytes = base64.b64decode(obj.audio_data)
-                except Exception:
-                    # If not base64, maybe it's a file path? For now assume base64 error
-                    raise ValueError("Invalid base64 string in audio_data")
-            else:
-                audio_bytes = obj.audio_data
-
-            # Debug: log audio bytes info
-            logger.info("=" * 60)
-            logger.info("ASR Audio Loading Debug:")
-            logger.info("  audio_bytes size: %d bytes", len(audio_bytes))
-            logger.info("  audio_bytes first 16 bytes: %s", audio_bytes[:16].hex())
-            logger.info("  target sample_rate: %d Hz", obj.sample_rate)
-
-            # Use smart loader to handle WAV/MP3 or Raw PCM
-            audio_array = self._load_audio_from_bytes(audio_bytes, target_sr=obj.sample_rate)
-
-            # Debug: log audio array info
-            logger.info("  audio_array shape: %s", audio_array.shape)
-            logger.info("  audio_array dtype: %s", audio_array.dtype)
-            logger.info("  audio_array min: %.6f, max: %.6f", audio_array.min(), audio_array.max())
-            logger.info("  audio_array mean: %.6f, std: %.6f", audio_array.mean(), audio_array.std())
-            logger.info("  audio duration: %.3f seconds", len(audio_array) / obj.sample_rate)
-            logger.info("=" * 60)
-        else:
-            raise ValueError("audio_data is required for ASR")
-
-        # Preprocess audio to mel spectrogram
-        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
-
-        # Tokenize the prompt (instruction)
-        # Split into prefix (before audio) and suffix (after audio) like audio_understanding
-        prefix_ids = None
-        suffix_ids = None
-        if obj.prompt and self.tokenizer is not None:
-            # Official MiMo format: [prefix] + [audio] + [suffix]
-            # prefix: <|im_start|>user\n
-            # suffix: {prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n
-            prefix_text = "<|im_start|>user\n"
-            suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n"
-            # suffix_text = f"{obj.prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n"
-
-            try:
-                prefix_ids = self.tokenizer(prefix_text)["input_ids"]
-                suffix_ids = self.tokenizer(suffix_text)["input_ids"]
-
-                # Dump tokenizer output for debugging
-                logger.info("=" * 60)
-                logger.info("ASR Tokenizer Output Dump:")
-                logger.info("  prefix_text: %r", prefix_text)
-                logger.info("  prefix_ids: %s", prefix_ids)
-                logger.info("  prefix decoded: %r", self.tokenizer.decode(prefix_ids))
-                logger.info("  suffix_text: %r", suffix_text)
-                logger.info("  suffix_ids: %s", suffix_ids)
-                logger.info("  suffix decoded: %r", self.tokenizer.decode(suffix_ids))
-                logger.info("=" * 60)
-            except Exception as e:
-                logger.warning("Failed to tokenize ASR prompt: %s", e)
-
-        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-
-        asr_req = Req(
-            rid=rid,
-            mel_input=mel_input,
-            mel_input_lens=mel_input_lens,
-            audio_mode="asr",
-            sample_rate=obj.sample_rate,
-            data_type=DataType.AUDIO,
-            text_input_ids=suffix_ids,
-            prompt_input_ids=prefix_ids,
-            prompt=obj.prompt,
-            n_q=8,
-        )
-
-        state = MMReqState(
-            rid=rid,
-            out_list=[],
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=created_time,
-        )
-        self.rid_to_state[rid] = state
-
-        self.send_to_scheduler.send_pyobj(asr_req)
-
-        try:
-            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
-        except TimeoutError:
-            raise ValueError(f"ASR request timed out for rid={rid}") from None
-
-        del self.rid_to_state[rid]
-
-        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
-
-        # Decode the generated text tokens to text
-        text = ""
-        if out.get("text") is not None:
-            text = out["text"]
-        elif out.get("generated_text_tokens") is not None and self.tokenizer is not None:
-            tokens = out["generated_text_tokens"]
-            if hasattr(tokens, "tolist"):
-                tokens = tokens.tolist()
-            text = self.tokenizer.decode(tokens, skip_special_tokens=True)
-
-        return ASRResponse(
-            id=rid,
-            text=text,
-        )
 
     async def chat_completion_audio(
         self,

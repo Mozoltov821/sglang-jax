@@ -86,7 +86,7 @@ class AudioScheduler:
 
     def preprocess(self, req: Req):
         sharding = NamedSharding(self.mesh, PartitionSpec())
-        if req.audio_mode in ("generation", "asr", "audio_understanding"):
+        if req.audio_mode in ("tts", "asr", "audio_understanding"):
             # Use mel_input (preprocessed in tokenizer) instead of audio_input
             if req.mel_input is not None:
                 req.mel_input = device_array(req.mel_input, sharding=sharding)
@@ -98,7 +98,7 @@ class AudioScheduler:
             mode = req.audio_mode
             logger.info("AudioScheduler.run_audio_batch: mode=%s, rid=%s", mode, req.rid)
 
-            if mode in ("generation", "asr", "audio_understanding"):
+            if mode in ("tts", "asr", "audio_understanding"):
                 if req.mel_input is not None:
                     output, _ = self.audio_worker.forward(
                         req, mode="encode", use_quantizer=req.use_quantizer, n_q=req.n_q

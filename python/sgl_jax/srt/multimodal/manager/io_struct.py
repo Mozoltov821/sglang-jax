@@ -51,46 +51,51 @@ class VideoResponse(BaseModel):
     path: str | None = None
 
 
-class AudioGenerationRequest(BaseModel):
-    audio_data: str
-    prompt: str | None = None
-    sample_rate: int = 24000
-    save_output: bool = False
+# === OpenAI Audio API Compatibility ===
+
+class AudioSpeechRequest(BaseModel):
+    """OpenAI /v1/audio/speech request."""
+    input: str                                    # 必需，最大 4096 字符
+    model: str                                    # tts-1, tts-1-hd, gpt-4o-mini-tts, etc.
+    voice: str                                    # alloy, echo, fable, onyx, nova, shimmer, etc.
+    response_format: str = "mp3"                 # mp3, opus, aac, flac, wav, pcm
+    speed: float = 1.0                           # 0.25-4.0
+    instructions: str | None = None              # 仅 gpt-4o 模型支持
+    stream_format: str | None = None             # sse 或 audio（仅 gpt-4o 模型）
 
 
-class AudioGenerationResponse(BaseModel):
-    id: str
-    audio_data: str | None = None       # base64 编码的音频
-    url: str | None = None              # 文件路径 (当 save_output=True)
-    sample_rate: int = 24000
+class AudioTranscriptionRequest(BaseModel):
+    """OpenAI /v1/audio/transcriptions request.
+
+    Note: 这是内部表示，实际 HTTP 端点支持 multipart/form-data 或 url
+    """
+    file: bytes | None = None                    # 音频文件字节（上传方式）
+    url: str | None = None                       # 音频文件 URL（URL 方式）
+    model: str                                   # gpt-4o-transcribe, whisper-1, etc.
+    language: str | None = None                  # ISO-639-1 代码
+    prompt: str | None = None                    # 上下文提示
+    response_format: str = "json"                # json, text, srt, verbose_json, vtt, diarized_json
+    temperature: float | None = None             # 0-1
+    timestamp_granularities: list[str] | None = None  # ["word", "segment"]
+    chunking_strategy: dict | None = None        # auto 或 server_vad
+    known_speaker_names: list[str] | None = None # 最多 4 个
+    known_speaker_references: list[str] | None = None  # data URLs
+    include: list[str] | None = None             # ["logprobs"]
+    stream: bool = False                         # SSE 流式传输
 
 
-class TTSRequest(BaseModel):
-    """Text-to-Speech request."""
-    text: str                           # 要合成的文本
-    prompt: str | None = None           # 声音风格提示词
-    save_output: bool = False           # 是否保存到文件
+class AudioTranscriptionResponse(BaseModel):
+    """OpenAI transcription response (json format)."""
+    text: str                                    # 转录文本
+    # verbose_json 额外字段:
+    task: str | None = None                      # "transcribe"
+    language: str | None = None                  # 检测到的语言
+    duration: float | None = None                # 音频时长（秒）
+    segments: list[dict] | None = None           # 时间戳片段
+    words: list[dict] | None = None              # 词级时间戳
 
-
-class TTSResponse(BaseModel):
-    """Text-to-Speech response."""
-    id: str
-    audio_data: str | None = None       # base64 编码的音频
-    url: str | None = None              # 文件路径 (当 save_output=True)
-    sample_rate: int = 24000
-
-
-class ASRRequest(BaseModel):
-    """Automatic Speech Recognition request."""
-    audio_data: str | bytes                     # base64 编码的音频数据 或 原始字节
-    sample_rate: int = 24000            # 采样率，默认 24kHz
-    prompt: str = "请转录这段音频"       # 指令/提示词，引导模型进行转录
-
-
-class ASRResponse(BaseModel):
-    """Automatic Speech Recognition response."""
-    id: str                             # 请求 ID
-    text: str                           # 转录的文本内容
+    # usage 统计
+    usage: dict | None = None                    # token 或 duration 统计
 
 
 # === OpenAI Audio Chat Compatibility ===
