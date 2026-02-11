@@ -9,7 +9,7 @@ from http import HTTPStatus
 
 import requests
 import uvicorn
-from fastapi import File, Form, Request, UploadFile
+from fastapi import Depends, File, Form, Request, UploadFile
 from fastapi.responses import ORJSONResponse, Response
 
 from sgl_jax.srt.entrypoints.http_server import _GlobalState, app, set_global_state
@@ -25,7 +25,6 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioTranscriptionResponse,
     DataType,
     GenerateMMReqInput,
-    GenerateOpenAIAudioInput,
     GenerateVLMReqInput,
     ImageGenerationsRequest,
     VideoGenerationsRequest,
@@ -204,8 +203,8 @@ async def videos_generation(obj: VideoGenerationsRequest, request: Request):
         return _create_error_response(e)
 
 
-# === OpenAI Audio API Endpoints ===
-
+# consistent with the openai interface
+# https://developers.openai.com/api/reference/python/resources/audio
 @app.post("/v1/audio/speech")
 async def create_speech(obj: AudioSpeechRequest, request: Request):
     """OpenAI-compatible Text-to-Speech endpoint.
@@ -225,8 +224,7 @@ async def create_speech(obj: AudioSpeechRequest, request: Request):
         return _create_error_response(e)
 
 
-@app.post("/v1/audio/transcriptions")
-async def create_transcription(
+async def parse_transcription_request(
     request: Request,
     file: UploadFile | None = File(None),
     url: str | None = Form(None),
@@ -235,81 +233,79 @@ async def create_transcription(
     prompt: str | None = Form(None),
     response_format: str = Form("json"),
     temperature: float | None = Form(None),
-    timestamp_granularities: str | None = Form(None),  # JSON string
+    timestamp_granularities: str | None = Form(None),
+    chunking_strategy: str | None = Form(None),
+    known_speaker_names: str | None = Form(None),
+    known_speaker_references: str | None = Form(None),
+    include: str | None = Form(None),
     stream: bool = Form(False),
-):
-    """OpenAI-compatible Speech-to-Text (transcription) endpoint.
+) -> AudioTranscriptionRequest:
+    """Parse multipart/form-data and wrap into AudioTranscriptionRequest."""
+    import json
 
-    Supports two input methods:
-    1. File upload: multipart/form-data with file
-    2. URL: Provide 'url' parameter, server downloads the audio
-    """
-    try:
-        from sgl_jax.srt.entrypoints.http_server import _global_state
+    # Validate input
+    if file is None and url is None:
+        raise ValueError("Either 'file' or 'url' parameter is required")
+    if file is not None and url is not None:
+        raise ValueError("Cannot provide both 'file' and 'url' parameters")
 
-        # 验证输入：file 和 url 必须提供其中之一
-        if file is None and url is None:
-            raise ValueError("Either 'file' or 'url' parameter is required")
-        if file is not None and url is not None:
-            raise ValueError("Cannot provide both 'file' and 'url' parameters")
-
-        audio_bytes = None
-        if file is not None:
-            # 文件上传方式
-            audio_bytes = await file.read()
-        elif url is not None:
-            # URL 下载方式
+    # Load audio bytes
+    audio_bytes = None
+    if file is not None:
+        audio_bytes = await file.read()
+    elif url is not None:
+        try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(url, timeout=30.0)
                 response.raise_for_status()
                 audio_bytes = response.content
+        except httpx.HTTPError as e:
+            raise ValueError(f"Failed to download audio from URL: {e}") from e
 
-        # 解析 timestamp_granularities（如果是 JSON string）
-        granularities = None
-        if timestamp_granularities:
-            import json
-            granularities = json.loads(timestamp_granularities)
+    # Parse JSON string parameters
+    granularities = json.loads(timestamp_granularities) if timestamp_granularities else None
+    chunking = json.loads(chunking_strategy) if chunking_strategy else None
+    speaker_names = json.loads(known_speaker_names) if known_speaker_names else None
+    speaker_refs = json.loads(known_speaker_references) if known_speaker_references else None
+    include_list = json.loads(include) if include else None
 
-        obj = AudioTranscriptionRequest(
-            file=audio_bytes,
-            url=url,  # 保留 URL 用于日志
-            model=model,
-            language=language,
-            prompt=prompt,
-            response_format=response_format,
-            temperature=temperature,
-            timestamp_granularities=granularities,
-            stream=stream,
-        )
-
-        result = await _global_state.tokenizer_manager.create_transcription(obj, request)
-
-        # 根据 response_format 返回不同格式
-        if response_format == "text":
-            return Response(content=result, media_type="text/plain")
-        elif response_format in ("srt", "vtt"):
-            return Response(content=result, media_type="text/plain")
-        else:  # json, verbose_json, diarized_json
-            return result  # FastAPI 自动序列化为 JSON
-
-    except ValueError as e:
-        logger.error("[http_server] create_transcription error: %s", e)
-        return _create_error_response(e)
-    except httpx.HTTPError as e:
-        logger.error("[http_server] Failed to download audio from URL: %s", e)
-        return _create_error_response(ValueError(f"Failed to download audio: {e}"))
+    return AudioTranscriptionRequest(
+        file=audio_bytes,
+        url=url,
+        model=model,
+        language=language,
+        prompt=prompt,
+        response_format=response_format,
+        temperature=temperature,
+        timestamp_granularities=granularities,
+        chunking_strategy=chunking,
+        known_speaker_names=speaker_names,
+        known_speaker_references=speaker_refs,
+        include=include_list,
+        stream=stream,
+    )
 
 
-@app.api_route("/api/v1/chat/completions", methods=["POST"])
-async def chat_completions(obj: GenerateOpenAIAudioInput, request: Request):
-    """OpenAI-compatible Chat Completions endpoint for multimodal audio."""
+@app.post("/v1/audio/transcriptions")
+async def create_transcription(
+    request: Request,
+    obj: AudioTranscriptionRequest = Depends(parse_transcription_request),
+):
     try:
         from sgl_jax.srt.entrypoints.http_server import _global_state
 
-        ret = await _global_state.tokenizer_manager.chat_completion_audio(obj, request)
-        return ret
+        result = await _global_state.tokenizer_manager.create_transcription(obj, request)
+
+        # Return different formats based on response_format
+        if obj.response_format == "text":
+            return Response(content=result, media_type="text/plain")
+        elif obj.response_format in ("srt", "vtt"):
+            return Response(content=result, media_type="text/plain")
+        else:  # json, verbose_json, diarized_json
+            return result
+
     except ValueError as e:
-        logger.error("[http_server] chat_completions error: %s", e)
+        logger.error("[http_server] create_transcription error: %s", e)
         return _create_error_response(e)
 
 
@@ -499,12 +495,6 @@ def _is_wan_model(model_path: str) -> bool:
     """Check if the model is a Wan model based on model path."""
     return "wan" in model_path.lower()
 
-
-def _is_audio_model(model_path: str) -> bool:
-    """Check if the model is an audio model based on model path."""
-    return "mimo-audio" in model_path.lower() or "audio-tokenizer" in model_path.lower()
-
-
 def _execute_multimodal_server_warmup(
     server_args: MultimodalServerArgs,
     pipe_finish_writer: mp.connection.Connection | None,
@@ -568,13 +558,16 @@ def _execute_multimodal_server_warmup(
             "num_inference_steps": 2,
             "save_output": False,
         }
-    elif _is_audio_model(server_args.model_path):
-        # 使用新的 OpenAI 端点进行 warmup
+    elif "MiMo-Audio" in server_args.model_path:
         request_endpoint = "/v1/audio/transcriptions"
-        # 构造 multipart/form-data 请求
-        # 使用空 WAV 文件作为 warmup
-        files = {"file": ("warmup.wav", b"", "audio/wav")}
-        data = {"model": "whisper-1"}
+        # audio_url = "https://huggingface.co/datasets/nvidia/AudioSkills/resolve/main/assets/WhDJDIviAOg_120_10.mp3"
+        audio_url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-Omni/cookbook/asr_zh.wav"
+        logger.info("Downloading warmup audio from: %s", audio_url)
+        audio_response = requests.get(audio_url, timeout=30)
+        audio_bytes = audio_response.content
+
+        files = {"file": ("warmup_audio.mp3", audio_bytes, "audio/mpeg")}
+        data = {"model": server_args.model_path}
 
         try:
             res = requests.post(
@@ -584,7 +577,8 @@ def _execute_multimodal_server_warmup(
                 headers=headers,
                 timeout=600,
             )
-            assert res.status_code == 200, f"{res}"
+            assert res.status_code == 200, f"{res.status_code}: {res.text}"
+            logger.info("Audio model warmup completed successfully")
         except Exception:
             last_traceback = get_exception_traceback()
             if pipe_finish_writer is not None:

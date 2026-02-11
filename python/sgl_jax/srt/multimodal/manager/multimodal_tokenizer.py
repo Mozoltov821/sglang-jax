@@ -35,9 +35,7 @@ from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioTranscriptionRequest,
     AudioTranscriptionResponse,
     DataType,
-    DataType,
     GenerateMMReqInput,
-    GenerateOpenAIAudioInput,
     GenerateVLMReqInput,
     TokenizedGenerateMMReqInput,
     TokenizedGenerateVLMReqInput,
@@ -53,6 +51,127 @@ from sgl_jax.srt.utils import (
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+
+class MiMoAudioProcessor:
+    """Custom processor for MiMo Audio models."""
+
+    def __init__(self):
+        from transformers.audio_utils import mel_filter_bank, window_function
+
+        sample_rate = 24000
+        n_fft = 960
+        hop_length = 240
+        win_length = 960
+        f_min = 0
+        f_max = 12000
+        n_mels = 128
+
+        self.sampling_rate = sample_rate
+        self.mel_filters = mel_filter_bank(
+            num_frequency_bins=n_fft // 2 + 1,
+            num_mel_filters=n_mels,
+            min_frequency=f_min,
+            max_frequency=f_max,
+            sampling_rate=sample_rate,
+            norm=None,
+            mel_scale="htk",
+        )
+        self.window = window_function(win_length, "hann")
+        self.mel_params = {
+            "sample_rate": sample_rate,
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "win_length": win_length,
+        }
+
+        logger.info(
+            "Initialized MiMoAudioProcessor: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
+            sample_rate, n_fft, hop_length, n_mels
+        )
+
+    def __call__(self, audio_array: np.ndarray, sampling_rate: int = None) -> tuple:
+        """Convert raw audio waveform to mel spectrogram.
+
+        This matches the official MiMo Audio implementation:
+        - Uses power=1.0 (amplitude spectrogram)
+        - Applies natural log via log_mel="log"
+        - Returns mel spectrogram in [batch, time, n_mels] format
+
+        Args:
+            audio_array: Raw audio waveform as numpy array, shape (samples,).
+            sampling_rate: Input audio sample rate. If different from target rate, will resample.
+
+        Returns:
+            Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
+            mel_spectrogram shape: [batch, time, n_mels]
+        """
+        from transformers.audio_utils import spectrogram
+
+        # Ensure 1D array
+        if audio_array.ndim == 2:
+            audio_array = audio_array.squeeze(0)
+
+        # Resample if input sample rate differs from target rate
+        if sampling_rate is not None and sampling_rate != self.sampling_rate:
+            audio_array = self._resample_audio(audio_array, sampling_rate, self.sampling_rate)
+
+        # Compute mel spectrogram with power=1.0 (matches official MiMo)
+        # spectrogram() returns [n_mels, time] with log_mel applied
+        mels = spectrogram(
+            waveform=audio_array,
+            window=self.window,
+            frame_length=self.mel_params["n_fft"],
+            hop_length=self.mel_params["hop_length"],
+            fft_length=self.mel_params["n_fft"],
+            power=1.0,  # Amplitude spectrogram (matches official MiMo)
+            center=True,
+            mel_filters=self.mel_filters,
+            log_mel="log",  # Natural logarithm (matches official torch.log)
+            mel_floor=1e-7,  # Matches official torch.clip(spec, min=1e-7)
+        )
+
+        # mels is [n_mels, time], transpose to [1, time, n_mels] for model input
+        mels = mels.T[None, :, :]  # [1, time, n_mels]
+        input_lens = np.array([mels.shape[1]])
+
+        logger.info(
+            "Audio preprocessing: input_samples=%d, mel_shape=%s, input_lens=%s",
+            len(audio_array),
+            mels.shape,
+            input_lens,
+        )
+        logger.info(
+            "  Mel stats: min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
+            mels.min(), mels.max(), mels.mean(), mels.std()
+        )
+
+        return mels, input_lens
+
+    def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """Resample audio to target sample rate using torchaudio.
+
+        Uses torchaudio.functional.resample to match official MiMo implementation.
+
+        Args:
+            audio: Input audio array.
+            orig_sr: Original sample rate.
+            target_sr: Target sample rate.
+
+        Returns:
+            Resampled audio array.
+        """
+        if orig_sr == target_sr:
+            return audio
+
+        import torch
+        import torchaudio
+
+        audio_tensor = torch.from_numpy(audio).float()
+        resampled = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
+        logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
+                    orig_sr, target_sr, len(audio), len(resampled))
+        return resampled.numpy().astype(np.float32)
 
 
 @dataclasses.dataclass
@@ -84,41 +203,43 @@ class MultimodalTokenizer(TokenizerManager):
         super().__init__(server_args, port_args)
         self.mm_processor = None
         self.mm_config = None
-        processor_candidates = [server_args.model_path]
-        model_basename = os.path.basename(server_args.model_path.rstrip("/"))
-        if model_basename in {
-            "text_encoder",
-            "vision_encoder",
-            "language_model",
-            "transformer",
-            "vae",
-            "tokenizer",
-        }:
-            processor_candidates.append(os.path.dirname(server_args.model_path.rstrip("/")))
-        trust_remote_code = server_args.trust_remote_code or server_args.multimodal
-        for candidate in processor_candidates:
-            try:
-                self.mm_processor = AutoProcessor.from_pretrained(
-                    candidate,
-                    trust_remote_code=trust_remote_code,
-                )
-                self.mm_config = AutoConfig.from_pretrained(
-                    candidate,
-                    trust_remote_code=trust_remote_code,
-                )
-                break
-            except Exception as exc:
-                logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
+
+        # since mimo-audio does not specify preprocessor, manual implementation is required to align
+        # it with the official implementation
+        model_path = server_args.model_path
+        is_mimo_audio = "mimo" in model_path.lower() and "audio" in model_path.lower()
+
+        if is_mimo_audio:
+            self.mm_processor = MiMoAudioProcessor()
+            logger.info("Loaded MiMoAudioProcessor for model: %s", model_path)
+        else:
+            processor_candidates = [model_path]
+            model_basename = os.path.basename(model_path.rstrip("/"))
+            if model_basename in {
+                "text_encoder",
+                "vision_encoder",
+                "language_model",
+                "transformer",
+                "vae",
+                "tokenizer",
+            }:
+                processor_candidates.append(os.path.dirname(model_path.rstrip("/")))
+            trust_remote_code = server_args.trust_remote_code or server_args.multimodal
+            for candidate in processor_candidates:
+                try:
+                    self.mm_processor = AutoProcessor.from_pretrained(
+                        candidate,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    self.mm_config = AutoConfig.from_pretrained(
+                        candidate,
+                        trust_remote_code=trust_remote_code,
+                    )
+                    break
+                except Exception as exc:
+                    logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
+
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
-
-        # Initialize processors for vision and audio
-        self.image_processor = None
-        self._init_image_processor(server_args.model_path)
-
-        # Initialize audio processor (WhisperFeatureExtractor) for audio models
-        self.audio_processor = None
-        self.audio_config = {}
-        self._init_audio_processor(server_args.model_path)
 
         # Initialize multimodal prompt builder for audio tasks
         self.prompt_builder = MultimodalPromptBuilder(tokenizer=self.tokenizer)
@@ -141,145 +262,6 @@ class MultimodalTokenizer(TokenizerManager):
             ]
         )
 
-    def _init_image_processor(self, model_path: str):
-        """Initialize image processor for multimodal models."""
-        try:
-            # Use slow image processor to avoid torchvision dependency warning
-            self.image_processor = AutoImageProcessor.from_pretrained(
-                model_path, use_fast=False
-            )
-        except Exception:
-            logger.warning("Failed to load image processor from %s", model_path)
-
-    def _init_audio_processor(self, model_path: str):
-        """Initialize audio processor for audio models using transformers audio_utils.
-
-        This loads the audio config and initializes mel filter bank and window function
-        that match the official MiMo Audio implementation (power=1.0, log_mel="log").
-        """
-        import json
-        import os
-
-        # Special case: for mimo-audio models, directly use default config
-        if "mimo" in model_path.lower() and "audio" in model_path.lower():
-            logger.info("Detected MiMo Audio model, using default mel processor configuration")
-            self._init_default_mel_processor()
-            return
-
-    def _init_default_mel_processor(self):
-        """Initialize mel processor with default MiMo Audio parameters.
-
-        Uses the official MiMo Audio parameters:
-        - sample_rate: 24000
-        - n_fft: 960
-        - hop_length: 240
-        - win_length: 960
-        - f_min: 0
-        - f_max: 12000 (Nyquist)
-        - n_mels: 128
-        """
-        from transformers.audio_utils import mel_filter_bank, window_function
-
-        # Default MiMo Audio parameters
-        sample_rate = 24000
-        n_fft = 960
-        hop_length = 240
-        win_length = 960
-        f_min = 0
-        f_max = 12000  # Nyquist frequency
-        n_mels = 128
-
-        # Create mel filter bank
-        # Use HTK mel scale and no norm to match torchaudio defaults
-        self.mel_filters = mel_filter_bank(
-            num_frequency_bins=n_fft // 2 + 1,
-            num_mel_filters=n_mels,
-            min_frequency=f_min,
-            max_frequency=f_max,
-            sampling_rate=sample_rate,
-            norm=None,  # Match torchaudio default (no area normalization)
-            mel_scale="htk",  # Match torchaudio default
-        )
-
-        # Create window function
-        self.window = window_function(win_length, "hann")
-
-        # Store parameters for spectrogram computation
-        self.mel_params = {
-            "sample_rate": sample_rate,
-            "n_fft": n_fft,
-            "hop_length": hop_length,
-            "win_length": win_length,
-        }
-
-        # Store sampling rate for resampling
-        self.audio_processor = type('AudioProcessor', (), {'sampling_rate': sample_rate})()
-        logger.warning(
-            "Initialized transformers audio_utils with defaults: sr=%d, n_fft=%d, hop=%d, n_mels=%d",
-            sample_rate, n_fft, hop_length, n_mels
-        )
-
-    def _preprocess_audio_to_mel(self, audio_array: np.ndarray, input_sr: int = None) -> tuple:
-        """Convert raw audio waveform to mel spectrogram using transformers audio_utils.
-
-        This matches the official MiMo Audio implementation:
-        - Uses power=1.0 (amplitude spectrogram)
-        - Applies natural log via log_mel="log"
-        - Returns mel spectrogram in [batch, time, n_mels] format
-
-        Args:
-            audio_array: Raw audio waveform as numpy array, shape (samples,).
-            input_sr: Input audio sample rate. If different from target rate, will resample.
-
-        Returns:
-            Tuple of (mel_spectrogram, input_lengths) as numpy arrays.
-            mel_spectrogram shape: [batch, time, n_mels]
-        """
-        from transformers.audio_utils import spectrogram
-
-        if not hasattr(self, 'mel_filters') or self.mel_filters is None:
-            raise ValueError("Mel filter bank not initialized. Cannot preprocess audio.")
-
-        # Ensure 1D array
-        if audio_array.ndim == 2:
-            audio_array = audio_array.squeeze(0)
-
-        # Resample if input sample rate differs from target rate
-        target_sr = self.audio_processor.sampling_rate
-        if input_sr is not None and input_sr != target_sr:
-            audio_array = self._resample_audio(audio_array, input_sr, target_sr)
-
-        # Compute mel spectrogram with power=1.0 (matches official MiMo)
-        # spectrogram() returns [n_mels, time] with log_mel applied
-        mels = spectrogram(
-            waveform=audio_array,
-            window=self.window,
-            frame_length=self.mel_params["n_fft"],
-            hop_length=self.mel_params["hop_length"],
-            fft_length=self.mel_params["n_fft"],
-            power=1.0,  # Amplitude spectrogram (matches official MiMo)
-            center=True,
-            mel_filters=self.mel_filters,
-            log_mel="log",  # Natural logarithm (matches official torch.log)
-            mel_floor=1e-7,  # Matches official torch.clip(spec, min=1e-7)
-        )
-
-        # mels is [n_mels, time], transpose to [1, time, n_mels] for model input
-        mels = mels.T[None, :, :]  # [1, time, n_mels]
-        input_lens = np.array([mels.shape[1]])
-
-        logger.info(
-            "Audio preprocessing (transformers audio_utils): input_samples=%d, mel_shape=%s, input_lens=%s",
-            len(audio_array),
-            mels.shape,
-            input_lens,
-        )
-        logger.info(
-            "  Mel stats: min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
-            mels.min(), mels.max(), mels.mean(), mels.std()
-        )
-
-        return mels, input_lens
 
     def _handle_batch_output(self, reqs: list | BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut):
         """Handle a batch of outputs returned from the pipeline.
@@ -835,8 +817,8 @@ class MultimodalTokenizer(TokenizerManager):
         # Load audio file
         audio_array = self._load_audio_from_bytes(obj.file, target_sr=24000)
 
-        # Preprocess to mel spectrogram
-        mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
+        # Preprocess to mel spectrogram (audio already at 24kHz, no resampling needed)
+        mel_input, mel_input_lens = self.mm_processor(audio_array, sampling_rate=None)
 
         # Build prompt using prompt builder
         prefix_ids, suffix_ids = self.prompt_builder.build_and_tokenize_asr(obj.prompt)
@@ -965,172 +947,6 @@ class MultimodalTokenizer(TokenizerManager):
         logger.debug("Audio loaded: orig_sr=%d, target_sr=%d, samples=%d",
                      orig_sr, target_sr, len(audio_array))
         return audio_array
-
-    def _resample_audio(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """Resample audio to target sample rate using torchaudio.
-
-        Uses torchaudio.functional.resample to match official MiMo implementation.
-
-        Args:
-            audio: Input audio array.
-            orig_sr: Original sample rate.
-            target_sr: Target sample rate.
-
-        Returns:
-            Resampled audio array.
-        """
-        if orig_sr == target_sr:
-            return audio
-
-        import torch
-        import torchaudio
-
-        audio_tensor = torch.from_numpy(audio).float()
-        resampled = torchaudio.functional.resample(audio_tensor, orig_sr, target_sr)
-        logger.info("Resampled audio from %d Hz to %d Hz (%d -> %d samples)",
-                    orig_sr, target_sr, len(audio), len(resampled))
-        return resampled.numpy().astype(np.float32)
-
-    async def chat_completion_audio(
-        self,
-        obj: GenerateOpenAIAudioInput,
-        request: fastapi.Request | None = None,
-    ):
-        """OpenAI-compatible chat completion for multimodal audio.
-
-        Args:
-            obj: GenerateOpenAIAudioInput containing messages and audio config.
-            request: FastAPI request object.
-
-        Returns:
-            A dict formatted as an OpenAI Chat Completion response.
-        """
-        created_time = time.time()
-        async with self._cond:
-            await self._cond.wait_for(lambda: not self._updating)
-
-        self.auto_create_handle_loop()
-
-        rid = uuid.uuid4().hex
-
-        # 1. Parse messages to extract prompt and audio
-        prompt_text = ""
-        audio_data_bytes = None
-
-        for msg in obj.messages:
-            if isinstance(msg.content, str):
-                if msg.role == "user":
-                    prompt_text += msg.content + "\n"
-            elif isinstance(msg.content, list):
-                for part in msg.content:
-                    if part.type == "text":
-                        prompt_text += part.text + "\n"
-                    elif part.type == "input_audio":
-                        # We only support one audio input for now (MiMo Audio limitation)
-                        if part.input_audio:
-                            if part.input_audio.data:
-                                try:
-                                    audio_data_bytes = base64.b64decode(part.input_audio.data)
-                                except Exception:
-                                    logger.warning("Failed to decode base64 audio in chat_completion")
-                            elif part.input_audio.url:
-                                try:
-                                    # Download audio from URL
-                                    logger.info("Downloading audio from URL: %s", part.input_audio.url)
-                                    # Using a timeout to prevent hanging
-                                    resp = requests.get(part.input_audio.url, timeout=30)
-                                    resp.raise_for_status()
-                                    audio_data_bytes = resp.content
-                                    logger.info("Downloaded %d bytes", len(audio_data_bytes))
-                                except Exception as e:
-                                    logger.warning("Failed to download audio from URL: %s", e)
-
-        # 2. Construct Prompt using prompt builder
-        # Official MiMo format: <|im_start|>user\n[AUDIO]{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n
-        # Audio comes FIRST, then instruction/question
-
-        prefix_ids, suffix_ids = self.prompt_builder.build_and_tokenize_audio_understanding(
-            prompt_text.strip()
-        )
-
-        # 3. Process audio if present
-        mel_input = None
-        mel_input_lens = None
-        if audio_data_bytes:
-            # Use our smart loader (handles WAV/MP3/etc.)
-            audio_array = self._load_audio_from_bytes(audio_data_bytes)
-            mel_input, mel_input_lens = self._preprocess_audio_to_mel(audio_array)
-
-        # 4. Create internal Req and send to scheduler
-        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
-
-        # We use audio_understanding mode for general chat with audio
-        internal_req = Req(
-            rid=rid,
-            mel_input=mel_input,
-            mel_input_lens=mel_input_lens,
-            audio_mode="audio_understanding",
-            text_input_ids=suffix_ids,
-            prompt_input_ids=prefix_ids,
-            data_type=DataType.AUDIO,
-            sample_rate=24000,
-            prompt=prompt_text,
-            n_q=8,
-            max_new_tokens=obj.max_tokens or 256,
-        )
-
-        state = MMReqState(
-            rid=rid,
-            out_list=[],
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            created_time=created_time,
-        )
-        self.rid_to_state[rid] = state
-
-        self.send_to_scheduler.send_pyobj(internal_req)
-
-        # 5. Wait for result
-        try:
-            await asyncio.wait_for(state.event.wait(), timeout=self.wait_timeout)
-        except TimeoutError:
-            raise ValueError(f"Chat completion request timed out for rid={rid}") from None
-
-        del self.rid_to_state[rid]
-        out = state.out_list[-1] if state.out_list else {"success": True, "meta_info": {}}
-
-        # 6. Format response as OpenAI Chat Completion
-        result_text = out.get("text", "")
-
-        # Extract raw tokens if text is empty (debug fallback)
-        if not result_text and out.get("generated_text_tokens") is not None and self.tokenizer is not None:
-            tokens = out["generated_text_tokens"]
-            if hasattr(tokens, "tolist"):
-                tokens = tokens.tolist()
-            result_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
-
-        return {
-            "id": f"chatcmpl-{rid}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": obj.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": result_text,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": len(prefix_ids) + len(suffix_ids),
-                "completion_tokens": len(out.get("generated_text_tokens", [])),
-                "total_tokens": len(prefix_ids) + len(suffix_ids) + len(out.get("generated_text_tokens", [])),
-            }
-        }
 
 
 def run_multimodal_tokenizer_process(
