@@ -46,6 +46,7 @@ dependencies = [
     "imageio[ffmpeg]",
     "qwix",
     "librosa",
+    "soundfile",
 ]
 
 [project.optional-dependencies]
@@ -66,6 +67,7 @@ all = [
 multimodal = [
     "torch",
     "torchvision",
+    "torchaudio",
 ]
 
 [tool.setuptools.packages.find]
