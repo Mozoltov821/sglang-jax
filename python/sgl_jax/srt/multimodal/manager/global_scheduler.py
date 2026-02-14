@@ -443,28 +443,6 @@ class GlobalScheduler:
                         )
                         continue
 
-                    if self.stage_configs[i].scheduler == "audio_backbone":
-                        if not stage_result.is_finished:
-                            self._handle_backbone_continue(stage_result, i)
-                            continue
-                        else:
-                            tracking_state = self.req_store.get(stage_result.rid)
-                            if tracking_state is not None:
-                                if not hasattr(tracking_state, "accumulated_text_tokens"):
-                                    tracking_state.accumulated_text_tokens = []
-                                if stage_result.generated_text_tokens is not None:
-                                    tracking_state.accumulated_text_tokens.extend(
-                                        stage_result.generated_text_tokens.tolist()
-                                    )
-                                stage_result.generated_text_tokens = (
-                                    tracking_state.accumulated_text_tokens
-                                )
-                                logger.info(
-                                    "Backbone finished for rid=%s, total tokens=%d",
-                                    stage_result.rid,
-                                    len(tracking_state.accumulated_text_tokens),
-                                )
-
                     if self.stage_configs[i].final_output:
                         self.send_to_detokenizer.send_pyobj(stage_result)
                         del self.req_store[stage_result.rid]
@@ -477,60 +455,6 @@ class GlobalScheduler:
                         )
                         for stage_req in stage_reqs:
                             self.in_queues[next_stage].put_nowait(stage_req)
-
-    def _handle_backbone_continue(self, req: Req, stage_idx: int):
-        """Handle backbone stage continuation for autoregressive generation.
-
-        Builds next step input and sends request back to backbone stage.
-
-        Args:
-            req: The request with generated tokens.
-            stage_idx: The backbone stage index.
-        """
-        tracking_state = self.req_store.get(req.rid)
-        if tracking_state is None:
-            logger.warning("Request %s not found in req_store for backbone continuation", req.rid)
-            return
-
-        if not hasattr(tracking_state, "accumulated_text_tokens"):
-            tracking_state.accumulated_text_tokens = []
-        if req.generated_text_tokens is not None:
-            tracking_state.accumulated_text_tokens.extend(req.generated_text_tokens.tolist())
-
-        if not hasattr(tracking_state, "accumulated_audio_tokens"):
-            tracking_state.accumulated_audio_tokens = []
-        if req.generated_audio_tokens is not None:
-            tracking_state.accumulated_audio_tokens.append(req.generated_audio_tokens)
-
-        if req.is_finished:
-            req.generated_text_tokens = tracking_state.accumulated_text_tokens
-            if self.stage_configs[stage_idx].final_output:
-                self.send_to_detokenizer.send_pyobj(req)
-                del self.req_store[req.rid]
-            else:
-                next_stage = stage_idx + 1
-                self.req_store[req.rid].current_stage = next_stage
-                stage_reqs = req.to_stage_reqs(self.stage_configs[next_stage].scheduler)
-                for stage_req in stage_reqs:
-                    self.in_queues[next_stage].put_nowait(stage_req)
-            return
-
-        try:
-            req.input_ids = req.build_next_step_input()
-            logger.info(
-                "\n\nBackbone continue for rid=%s, step=%d, input_ids shape=%s",
-                req.rid,
-                len(tracking_state.accumulated_text_tokens),
-                req.input_ids.shape if req.input_ids is not None else None,
-            )
-            self.in_queues[stage_idx].put_nowait(req)
-        except Exception as e:
-            logger.error("Failed to build next step input for rid=%s: %s", req.rid, e)
-            req.is_finished = True
-            req.generated_text_tokens = tracking_state.accumulated_text_tokens
-            if self.stage_configs[stage_idx].final_output:
-                self.send_to_detokenizer.send_pyobj(req)
-                del self.req_store[req.rid]
 
 
 def run_global_scheduler_process(
