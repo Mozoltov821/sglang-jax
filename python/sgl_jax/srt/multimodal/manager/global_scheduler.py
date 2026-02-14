@@ -24,6 +24,7 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
 )
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
+    TokenizedGenerateAudioReqInput,
     TokenizedGenerateMMReqInput,
     TokenizedGenerateVLMReqInput,
 )
@@ -141,9 +142,9 @@ class GlobalScheduler:
             [
                 (TokenizedGenerateMMReqInput, self.convert_request),
                 (TokenizedGenerateVLMReqInput, self.convert_vlm_request),
+                (TokenizedGenerateAudioReqInput, self.convert_audio_request),
                 (AbortReq, self.handle_abort_request),
                 (ProfileReq, self.handle_profile),
-                (Req, self.handle_audio_request),
             ]
         )
 
@@ -255,7 +256,24 @@ class GlobalScheduler:
         self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)
         return req
 
-    def handle_audio_request(self, req: Req):
+    def convert_audio_request(self, input: TokenizedGenerateAudioReqInput):
+        """Convert a tokenized audio input into internal Req.
+
+        Creates a Req object for audio tasks (TTS, ASR, audio understanding).
+        """
+        req = Req(
+            rid=input.rid,
+            audio_mode=input.audio_mode,
+            data_type=input.data_type,
+            text=input.text,
+            text_input_ids=input.text_input_ids,
+            prompt=input.prompt,
+            prompt_input_ids=input.prompt_input_ids,
+            mel_input=input.mel_input,
+            mel_input_lens=input.mel_input_lens,
+            sample_rate=input.sample_rate,
+            n_q=input.n_q,
+        )
         if req.rid in self.req_store:
             raise RuntimeError(f"{req.rid} is already in req_store")
         self.req_store[req.rid] = ReqTrackingState(req=req, current_stage=0)

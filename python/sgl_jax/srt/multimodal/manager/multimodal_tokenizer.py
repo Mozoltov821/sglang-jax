@@ -722,9 +722,9 @@ class MultimodalTokenizer(TokenizerManager):
             obj.input, obj.instructions
         )
 
-        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+        from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateAudioReqInput
 
-        tts_req = Req(
+        tts_req = TokenizedGenerateAudioReqInput(
             rid=rid,
             audio_mode="tts",
             text=obj.input,
@@ -732,7 +732,7 @@ class MultimodalTokenizer(TokenizerManager):
             prompt=obj.instructions,
             prompt_input_ids=prompt_input_ids,
             data_type=DataType.AUDIO,
-            sample_rate=24000,  # Default sample rate, can be adjusted based on response_format
+            sample_rate=24000,
         )
 
         state = MMReqState(
@@ -797,9 +797,9 @@ class MultimodalTokenizer(TokenizerManager):
 
         prefix_ids, suffix_ids = self.prompt_builder.build_and_tokenize_asr(obj.prompt)
 
-        from sgl_jax.srt.multimodal.manager.schedule_batch import Req
+        from sgl_jax.srt.multimodal.manager.io_struct import TokenizedGenerateAudioReqInput
 
-        asr_req = Req(
+        asr_req = TokenizedGenerateAudioReqInput(
             rid=rid,
             mel_input=mel_input,
             mel_input_lens=mel_input_lens,
