@@ -27,9 +27,11 @@ logger = logging.getLogger(__name__)
 # Kept for backward compatibility if config doesn't have eos_token_id
 MIMO_EOS_TOKENS_FALLBACK = {151672, 151643, 151645, 151671}  # EOT, EOS, IM_END, EOSTM
 MIMO_GROUP_SIZE = 4
-MAX_GROUPS = 512
-MAX_NEW_TOKENS = 256
-MAX_TOTAL_GROUPS = MAX_GROUPS + MAX_NEW_TOKENS  # Total cache slots to pre-allocate
+
+# Precompile padding sizes for audio groups (similar to token_paddings in LLM)
+# These values will be used to pad input audio to avoid recompilation
+DEFAULT_AUDIO_INPUT_GROUP_PADDINGS = [64, 128, 256, 512, 1024]
+DEFAULT_AUDIO_GENERATION_GROUP_PADDINGS = [64, 128, 256, 512, 1024]
 
 
 class AudioBackboneScheduler:
@@ -68,6 +70,10 @@ class AudioBackboneScheduler:
 
         self.rng_key = jax.random.PRNGKey(42)
 
+        # Initialize precompile padding sizes (similar to LLM's token_paddings)
+        self.input_group_paddings = sorted(DEFAULT_AUDIO_INPUT_GROUP_PADDINGS)
+        self.generation_group_paddings = sorted(DEFAULT_AUDIO_GENERATION_GROUP_PADDINGS)
+
         with self.mesh:
             self.backbone_worker = AudioBackboneModelWorker(
                 model_class=model_class, mesh=self.mesh, server_args=server_args
@@ -95,6 +101,28 @@ class AudioBackboneScheduler:
             logger.warning(
                 "Model config does not have eos_token_id, using fallback: %s", self.eos_token_ids
             )
+
+    def _find_padding_size(self, actual_size: int, padding_list: list[int]) -> int:
+        """Find the smallest padding size >= actual_size.
+
+        This reuses the padding logic from LLM scheduler (schedule_batch.get_model_worker_batch).
+
+        Args:
+            actual_size: The actual size that needs to be padded.
+            padding_list: List of precompiled padding sizes (must be sorted).
+
+        Returns:
+            The padded size. If actual_size exceeds all padding sizes, returns actual_size.
+        """
+        for size in padding_list:
+            if size >= actual_size:
+                return size
+        # If actual_size is larger than all padding sizes, use actual_size (will trigger recompilation)
+        logger.warning(
+            "Actual size %d exceeds all padding sizes %s, will trigger recompilation",
+            actual_size, padding_list
+        )
+        return actual_size
 
     def event_loop_normal(self):
         """Main blocking loop for processing requests.
@@ -163,17 +191,25 @@ class AudioBackboneScheduler:
         """Create ForwardBatch with fixed shape for JIT compilation.
 
         Key insight: Pre-allocate all cache slots during prefill to keep cache_loc shape fixed.
+        Uses dynamic padding sizes instead of hardcoded MAX_GROUPS.
         """
         B = 1  # Batch size is always 1 for MiMo Audio
 
         if is_prefill:
+            # Find padded size for input groups
+            padded_input_groups = self._find_padding_size(actual_T_groups, self.input_group_paddings)
+
+            # Use max generation padding for cache allocation
+            max_gen_groups = self.generation_group_paddings[-1]
+            total_cache_groups = padded_input_groups + max_gen_groups
+
             # Prefill: Pre-allocate all cache slots (input + future generation)
             # This ensures cache_loc has fixed shape throughout generation
             all_cache_loc = self.backbone_worker.model_runner.token_to_kv_pool_allocator.alloc(
-                MAX_TOTAL_GROUPS * B
+                total_cache_groups * B
             )
             if all_cache_loc is None:
-                raise RuntimeError(f"Failed to allocate {MAX_TOTAL_GROUPS} KV cache slots")
+                raise RuntimeError(f"Failed to allocate {total_cache_groups} KV cache slots")
 
             self._cache_locations[rid] = all_cache_loc
             self._total_seq_lens[rid] = actual_T_groups
@@ -184,7 +220,7 @@ class AudioBackboneScheduler:
             positions = jnp.arange(T_groups, dtype=jnp.int32)
             forward_mode = ForwardMode.EXTEND
             extend_start_loc = jnp.array([0], dtype=jnp.int32)
-            extend_seq_lens = jnp.array([actual_T_groups] * B, dtype=jnp.int32)  # ✅ Use actual!
+            extend_seq_lens = jnp.array([actual_T_groups] * B, dtype=jnp.int32)
             extend_prefix_lens = jnp.zeros(B, dtype=jnp.int32)
 
         else:
@@ -270,13 +306,14 @@ class AudioBackboneScheduler:
         is_prefill = existing_seq_len == 0
 
         if is_prefill:
-            if T_groups < MAX_GROUPS:
-                pad_len = (MAX_GROUPS - T_groups) * MIMO_GROUP_SIZE
+            # Find padded size using precompiled padding sizes
+            padded_groups = self._find_padding_size(T_groups, self.input_group_paddings)
+
+            if padded_groups > T_groups:
+                pad_len = (padded_groups - T_groups) * MIMO_GROUP_SIZE
                 input_ids = jnp.pad(input_ids, ((0, 0), (0, 0), (0, pad_len)), constant_values=0)
-                T_groups = MAX_GROUPS
-                logger.debug(f"Padded from {actual_T_groups} to {MAX_GROUPS} groups")
-            elif T_groups > MAX_GROUPS:
-                raise ValueError(f"Audio too long: {T_groups} groups > MAX_GROUPS={MAX_GROUPS}")
+                T_groups = padded_groups
+                logger.debug(f"Padded from {actual_T_groups} to {padded_groups} groups")
 
         forward_batch = self._create_forward_batch(input_ids, rid, T_groups, actual_T_groups, is_prefill)
 
@@ -344,6 +381,18 @@ class AudioBackboneScheduler:
 
                 if text_token_id in self.eos_token_ids:
                     logger.info("Generation finished for rid=%s at step %d (EOS)", req.rid, step_count)
+                    req.is_finished = True
+                    break
+
+                # Check if we have exceeded allocated cache
+                current_seq_len = self._total_seq_lens.get(req.rid, 0)
+                allocated_cache_size = len(self._cache_locations.get(req.rid, []))
+                if current_seq_len + 1 >= allocated_cache_size:
+                    logger.warning(
+                        "Generation reached cache limit for rid=%s (used %d/%d slots). "
+                        "Consider increasing generation_group_paddings.",
+                        req.rid, current_seq_len + 1, allocated_cache_size
+                    )
                     req.is_finished = True
                     break
 
