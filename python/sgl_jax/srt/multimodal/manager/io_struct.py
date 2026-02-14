@@ -189,24 +189,19 @@ class TokenizedGenerateVLMReqInput:
 
 @dataclasses.dataclass
 class TokenizedGenerateAudioReqInput:
-    """Tokenized audio request for TTS and ASR tasks."""
     rid: str | None = None
-    audio_mode: str | None = None  # "tts", "asr", "audio_understanding"
+    audio_mode: str | None = None
     data_type: DataType | None = None
-
-    # Text-related fields
-    text: str | None = None  # TTS text to synthesize
-    text_input_ids: list[int] | None = None  # Tokenized TTS text
-    prompt: str | None = None  # Voice style prompt or ASR prompt
-    prompt_input_ids: list[int] | None = None  # Tokenized prompt
-
-    # Audio input fields (for ASR/audio understanding)
-    mel_input: np.ndarray | None = None  # Preprocessed mel spectrogram
-    mel_input_lens: np.ndarray | None = None  # Lengths for mel spectrogram
+    text: str | None = None
+    text_input_ids: list[int] | None = None
+    prompt: str | None = None
+    prompt_input_ids: list[int] | None = None
+    mel_input: np.ndarray | None = None
+    mel_input_lens: np.ndarray | None = None
 
     # Audio configuration
     sample_rate: int = 24000
-    n_q: int | None = None  # Number of quantizer layers
+    n_q: int | None = None
 
 
 @dataclasses.dataclass
