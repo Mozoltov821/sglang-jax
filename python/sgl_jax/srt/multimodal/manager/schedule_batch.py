@@ -138,8 +138,6 @@ class Req:
     # Other parameters that may be needed by specific schedulers
     extra_step_kwargs: dict[str, Any] = field(default_factory=dict)
 
-    max_new_tokens: int = 256  # Max tokens for autoregressive generation
-
     # Component modules (populated by the pipeline)
     modules: dict[str, Any] = field(default_factory=dict)
 

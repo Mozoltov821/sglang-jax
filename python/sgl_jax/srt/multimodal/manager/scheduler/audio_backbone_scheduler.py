@@ -301,15 +301,14 @@ class AudioBackboneScheduler:
         for req in batch:
             sampler_config = self._get_sampler_config(req)
             accumulated_tokens = []
-            max_new_tokens = getattr(req, "max_new_tokens", 256)
             step_count = 0
 
             if getattr(req, "is_prefill", True):
                 self._reset_cache_state(req.rid)
 
-            logger.info("Starting generation loop for rid=%s, max_tokens=%d", req.rid, max_new_tokens)
+            logger.info("Starting generation loop for rid=%s", req.rid)
 
-            while step_count < max_new_tokens:
+            while True:
                 input_ids, forward_batch, logits_metadata = self._prepare_batch(req)
 
                 (text_logits_output, local_hidden_states, _), _ = self.backbone_worker.forward(
@@ -359,10 +358,6 @@ class AudioBackboneScheduler:
                     break
 
             req.generated_text_tokens = np.array(accumulated_tokens, dtype=np.int32)
-
-            if step_count >= max_new_tokens:
-                logger.warning("Generation hit max_tokens=%d for rid=%s", max_new_tokens, req.rid)
-                req.is_finished = True
 
             req.input_ids = None
             req.audio_codes = None

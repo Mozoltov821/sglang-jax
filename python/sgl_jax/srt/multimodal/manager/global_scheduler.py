@@ -502,14 +502,7 @@ class GlobalScheduler:
         if req.generated_audio_tokens is not None:
             tracking_state.accumulated_audio_tokens.append(req.generated_audio_tokens)
 
-        max_tokens = getattr(req, "max_new_tokens", 256)
-        if len(tracking_state.accumulated_text_tokens) >= max_tokens:
-            logger.info(
-                "Request %s reached max tokens limit (%d), finishing generation",
-                req.rid,
-                max_tokens,
-            )
-            req.is_finished = True
+        if req.is_finished:
             req.generated_text_tokens = tracking_state.accumulated_text_tokens
             if self.stage_configs[stage_idx].final_output:
                 self.send_to_detokenizer.send_pyobj(req)
