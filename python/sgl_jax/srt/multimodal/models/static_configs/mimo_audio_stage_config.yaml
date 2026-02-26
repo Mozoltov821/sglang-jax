@@ -7,7 +7,7 @@ stage_args:
   # Stage 0: Audio Encoder - encode input audio to discrete tokens
   - stage_id: 0
     runtime:
-      num_tpus: 2
+      num_tpus: 1
       max_batch_size: 1
       device_kind: tpu
     scheduler: audio_encoder
@@ -25,16 +25,16 @@ stage_args:
     scheduler: audio_backbone
     scheduler_params: {}
     model_class: MiMoAudioForCausalLM
-    final_output: true
+    final_output: false
 
-  # # Stage 2: Audio Decoder + Vocoder - decode audio tokens to waveform
-  # - stage_id: 2
-  #   runtime:
-  #     num_tpus: 1
-  #     max_batch_size: 1
-  #     device_kind: cpu
-  #   scheduler: audio_decoder
-  #   scheduler_params: {}
-  #   model_class: MiMoAudioTokenizer
-  #   model_path: XiaomiMiMo/MiMo-Audio-Tokenizer
-  #   final_output: true
+   # Stage 2: Audio Decoder + Vocoder - decode audio tokens to waveform
+  - stage_id: 2
+    runtime:
+      num_tpus: 1
+      max_batch_size: 1
+      device_kind: tpu
+    scheduler: audio_decoder
+    scheduler_params: {}
+    model_class: MiMoAudioTokenizer
+    model_path: XiaomiMiMo/MiMo-Audio-Tokenizer
+    final_output: true
